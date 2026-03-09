@@ -1,14 +1,5 @@
 """
 main.py — FastAPI application for IM|Copilot.
-
-Endpoints:
-  GET  /                          Health check
-  GET  /dashboard/{student_id}    Full student dashboard data
-  POST /chat                      Main AI chat endpoint
-  GET  /students                  List all students (dev/demo)
-  GET  /vector-store/stats        ChromaDB stats
-  POST /vector-store/reingest     Force re-ingestion of handbook
-  GET  /intent-test               Dev tool: classify a query intent
 """
 
 import os
@@ -24,9 +15,6 @@ from database import initialize_database, get_student_dashboard, execute_read_qu
 from vector_store import initialize_vector_store, get_collection_stats
 from agent import process_query, classify_intent
 
-# ─────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -34,9 +22,6 @@ logging.basicConfig(
 logger = logging.getLogger("imcopilot")
 
 
-# ─────────────────────────────────────────────────────────────
-# Lifespan: startup & shutdown
-# ─────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("=" * 50)
@@ -48,52 +33,55 @@ async def lifespan(app: FastAPI):
     initialize_database()
     logger.info("[Startup] SQLite ready.")
 
-    # 2. Initialize ChromaDB - Temporarily disabled due to NumPy compatibility issues
-    # handbook_path = os.path.abspath(
-    #     os.path.join(os.path.dirname(__file__), "..", "handbook.md")
-    # )
-    # logger.info("[Startup] Initializing ChromaDB...")
-    # stats = initialize_vector_store(
-    #     handbook_path if os.path.exists(handbook_path) else None
-    # )
-    # logger.info(f"[Startup] Vector store ready: {stats}")
-    logger.info("[Startup] Vector store initialization skipped (NumPy compatibility issue).")
-    logger.info("[Startup] Ready to serve.")
+    # 2. Initialize ChromaDB — FIX #1: re-enabled with graceful fallback
+    handbook_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "handbook.md")
+    )
+    logger.info("[Startup] Initializing ChromaDB vector store...")
+    try:
+        stats = initialize_vector_store(
+            handbook_path if os.path.exists(handbook_path) else None
+        )
+        logger.info(f"[Startup] Vector store ready: {stats['total_chunks']} chunks indexed.")
+    except Exception as e:
+        logger.warning(
+            f"[Startup] ChromaDB init failed ({e}). "
+            "Policy queries will use inline fallback — bot still works."
+        )
+
+    # 3. Warn if no API keys
+    groq_key   = os.getenv("GROQ_API_KEY",   "").strip()
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not groq_key and not gemini_key:
+        logger.error("[Startup] WARNING: No API keys found — chatbot will not respond!")
+    else:
+        providers = [p for p, k in [("Groq", groq_key), ("Gemini", gemini_key)] if k]
+        logger.info(f"[Startup] LLM providers: {', '.join(providers)}")
+
+    logger.info("[Startup] IM|Copilot is ready.")
 
     yield
 
     logger.info("[Shutdown] Goodbye.")
 
 
-# ─────────────────────────────────────────────────────────────
-# App
-# ─────────────────────────────────────────────────────────────
 app = FastAPI(
     title="IM|Copilot API",
-    description=(
-        "Hybrid AI Academic Assistant for IMSciences Peshawar. "
-        "Combines RAG (policy queries) with Text-to-SQL (academic data)."
-    ),
+    description="Hybrid AI Academic Assistant for IMSciences Peshawar.",
     version="1.0.0",
     lifespan=lifespan,
 )
 
+# FIX #2: CORS — allow all origins to fix "cannot connect to server" errors
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:5173",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],       # fixes localhost vs 127.0.0.1 mismatch
+    allow_credentials=False,   # must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ─────────────────────────────────────────────────────────────
-# Request / Response Models
-# ─────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     query:      str = Field(..., min_length=1, max_length=1000)
     student_id: str = Field(default="S001")
@@ -127,35 +115,23 @@ class DashboardResponse(BaseModel):
     status_summary:   dict
 
 
-# ─────────────────────────────────────────────────────────────
-# Routes
-# ─────────────────────────────────────────────────────────────
-
 @app.get("/", tags=["Health"])
 async def health_check():
+    groq_key   = os.getenv("GROQ_API_KEY",   "").strip()
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
     return {
-        "status":  "running",
-        "service": "IM|Copilot API",
-        "version": "1.0.0",
-        "docs":    "/docs",
+        "status":         "running",
+        "service":        "IM|Copilot API",
+        "version":        "1.0.0",
+        "docs":           "/docs",
+        "groq_key_set":   bool(groq_key),
+        "gemini_key_set": bool(gemini_key),
+        "llm_ready":      bool(groq_key or gemini_key),
     }
 
 
-@app.get(
-    "/dashboard/{student_id}",
-    response_model=DashboardResponse,
-    tags=["Dashboard"],
-    summary="Get full student dashboard",
-)
+@app.get("/dashboard/{student_id}", response_model=DashboardResponse, tags=["Dashboard"])
 async def get_dashboard(student_id: str):
-    """
-    Returns all data needed to render the student dashboard:
-    - Student profile (name, program, semester, CGPA)
-    - Grades per course (midterm, final, assignments, letter grade)
-    - Attendance per course (attended/total, percentage, status)
-    - At-risk courses (attendance < 80%)
-    - Status summary (probation flag, XF risk count)
-    """
     data = get_student_dashboard(student_id.upper())
     if not data:
         raise HTTPException(
@@ -166,25 +142,23 @@ async def get_dashboard(student_id: str):
     cgpa    = data["student"].get("cgpa", 0.0)
     avg_att = data["avg_attendance"]
 
-    # GPA status label
     if   cgpa >= 3.5: gpa_status = "excellent"
     elif cgpa >= 2.5: gpa_status = "good"
     elif cgpa >= 2.2: gpa_status = "satisfactory"
     elif cgpa >= 2.0: gpa_status = "probation"
     else:             gpa_status = "critical"
 
-    # Attendance status label
     if   avg_att >= 85: att_status = "good"
     elif avg_att >= 80: att_status = "borderline"
     else:               att_status = "at_risk"
 
     status_summary = {
-        "cgpa_status":           gpa_status,
-        "attendance_status":     att_status,
-        "on_probation":          cgpa < 2.2,
-        "xf_risk_count":         len(data["at_risk_courses"]),
-        "probation_threshold":   2.2,
-        "attendance_threshold":  80.0,
+        "cgpa_status":          gpa_status,
+        "attendance_status":    att_status,
+        "on_probation":         cgpa < 2.2,
+        "xf_risk_count":        len(data["at_risk_courses"]),
+        "probation_threshold":  2.2,
+        "attendance_threshold": 80.0,
     }
 
     return DashboardResponse(
@@ -194,51 +168,24 @@ async def get_dashboard(student_id: str):
     )
 
 
-@app.post(
-    "/chat",
-    response_model=ChatResponse,
-    tags=["Chat"],
-    summary="Send a message to IM|Copilot",
-)
+@app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(request: ChatRequest):
-    """
-    Main AI chat endpoint. Routes through the Intent Router:
-
-    - **ACADEMIC** → SQL Agent: Text-to-SQL on the student database
-    - **POLICY**   → RAG Agent: ChromaDB handbook retrieval + LLM
-    - **HYBRID**   → Both agents: personalized policy-aware answer
-    - **GREETING** → Friendly welcome response
-
-    The `metadata` field contains agent-specific info:
-    - For ACADEMIC: `sql_generated`, `rows_returned`
-    - For POLICY:   `chunks_retrieved`, `sources`
-    - For HYBRID:   both of the above
-    """
-    logger.info(
-        f"[/chat] student={request.student_id} "
-        f"query='{request.query[:60]}'"
-    )
+    logger.info(f"[/chat] student={request.student_id} query='{request.query[:60]}'")
 
     result = process_query(
         query=request.query,
         student_id=request.student_id.upper(),
     )
 
-    intent = result.get("intent", "unknown")
-
+    intent   = result.get("intent", "unknown")
     metadata: dict = {"error": result.get("error")}
 
     if intent == "academic":
         metadata["sql_generated"] = result.get("sql")
         metadata["rows_returned"] = len(result.get("data") or [])
-
     elif intent == "policy":
         metadata["chunks_retrieved"] = len(result.get("chunks") or [])
-        metadata["sources"] = list({
-            c.get("source", "handbook")
-            for c in (result.get("chunks") or [])
-        })
-
+        metadata["sources"] = list({c.get("source", "handbook") for c in (result.get("chunks") or [])})
     elif intent == "hybrid":
         metadata["sql_generated"]    = result.get("sql")
         metadata["rows_returned"]    = len(result.get("data") or [])
@@ -254,27 +201,13 @@ async def chat(request: ChatRequest):
 
 
 @app.get("/students", tags=["Dev / Demo"])
-async def list_students(
-    program: Optional[str] = Query(
-        None,
-        description="Filter by program: BBA, BCS, MBA"
+async def list_students(program: Optional[str] = Query(None)):
+    sql = (
+        f"SELECT student_id, name, program, semester, cgpa FROM students "
+        f"WHERE UPPER(program) = '{program.upper()}' ORDER BY student_id"
+        if program else
+        "SELECT student_id, name, program, semester, cgpa FROM students ORDER BY student_id"
     )
-):
-    """
-    Lists all students. Used by the demo login selector on the frontend.
-    """
-    if program:
-        sql = (
-            f"SELECT student_id, name, program, semester, cgpa "
-            f"FROM students WHERE UPPER(program) = '{program.upper()}' "
-            f"ORDER BY student_id"
-        )
-    else:
-        sql = (
-            "SELECT student_id, name, program, semester, cgpa "
-            "FROM students ORDER BY student_id"
-        )
-
     try:
         rows = execute_read_query(sql)
         return {"students": rows, "count": len(rows)}
@@ -284,11 +217,8 @@ async def list_students(
 
 @app.get("/students/{student_id}", tags=["Dev / Demo"])
 async def get_student(student_id: str):
-    """Returns basic profile for a single student."""
     try:
-        rows = execute_read_query(
-            f"SELECT * FROM students WHERE student_id = '{student_id.upper()}'"
-        )
+        rows = execute_read_query(f"SELECT * FROM students WHERE student_id = '{student_id.upper()}'")
         if not rows:
             raise HTTPException(status_code=404, detail="Student not found.")
         return rows[0]
@@ -300,68 +230,40 @@ async def get_student(student_id: str):
 
 @app.get("/vector-store/stats", tags=["Vector Store"])
 async def vector_store_stats():
-    """Returns ChromaDB collection stats."""
-    return get_collection_stats()
+    try:
+        return get_collection_stats()
+    except Exception as e:
+        return {"error": str(e), "message": "Vector store not available"}
 
 
 @app.post("/vector-store/reingest", tags=["Vector Store"])
 async def reingest_handbook():
-    """
-    Clears and re-ingests the handbook into ChromaDB.
-    Use this when the handbook document is updated.
-    """
     try:
         import chromadb
         from vector_store import CHROMA_PATH, COLLECTION_NAME
         from chromadb.config import Settings
         import vector_store as vs
 
-        client = chromadb.PersistentClient(
-            path=CHROMA_PATH,
-            settings=Settings(anonymized_telemetry=False)
-        )
+        client = chromadb.PersistentClient(path=CHROMA_PATH, settings=Settings(anonymized_telemetry=False))
         try:
             client.delete_collection(COLLECTION_NAME)
-            logger.info("[Reingest] Old collection deleted.")
         except Exception:
             pass
+        vs._collection = None
 
-        vs._collection = None  # Reset singleton
-
-        handbook_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "handbook.md")
-        )
-        stats = initialize_vector_store(
-            handbook_path if os.path.exists(handbook_path) else None
-        )
+        handbook_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "handbook.md"))
+        stats = initialize_vector_store(handbook_path if os.path.exists(handbook_path) else None)
         return {"status": "success", "stats": stats}
-
     except Exception as e:
-        logger.error(f"[Reingest] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/intent-test", tags=["Dev / Demo"])
-async def test_intent(
-    q: str = Query(..., description="Query string to classify")
-):
-    """
-    Development tool: classifies a query's intent without running the full agent.
-    Useful for debugging the Intent Router.
-    """
+async def test_intent(q: str = Query(...)):
     intent = classify_intent(q)
     return {"query": q, "intent": intent.value}
 
 
-# ─────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info",
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")

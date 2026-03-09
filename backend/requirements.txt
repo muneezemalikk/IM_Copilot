@@ -7,18 +7,17 @@ uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 
 # ── LLM Providers ─────────────────────────────────────────
-groq==0.8.0               # Groq API (Llama-3) — primary fast inference
-google-generativeai==0.5.4 # Google Gemini — fallback
+groq==0.8.0
+google-generativeai==0.5.4
+
+# ── NumPy MUST be pinned before chromadb/sentence-transformers ──
+numpy==1.26.4
 
 # ── Vector Store & Embeddings ─────────────────────────────
-chromadb==0.4.24          # Older version compatible with NumPy < 2.0
+chromadb==0.4.24
 sentence-transformers==2.7.0
 
 # ── Data & Utilities ──────────────────────────────────────
 pydantic==2.7.1
 python-dotenv==1.0.1
-numpy<2.0                  # Explicit NumPy version constraint
-
-# ── Optional: LangGraph for advanced orchestration ────────
-# langgraph==0.1.0
-# langchain-core==0.2.0
+httpx==0.27.0

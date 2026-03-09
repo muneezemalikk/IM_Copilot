@@ -1,16 +1,5 @@
 """
 agent.py — The brain of IM|Copilot.
-
-Architecture:
-  User Query
-      |
-  Intent Router  (rule-based keywords + LLM fallback)
-      |          |
-  ACADEMIC     POLICY      HYBRID
-      |          |            |
-  SQL Agent   RAG Agent   Both agents
-      |          |            |
-  Response Builder (natural language formatting)
 """
 
 import os
@@ -28,12 +17,9 @@ from vector_store import retrieve_context, build_rag_context_string
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────
-# LLM Provider Setup
-# ─────────────────────────────────────────────────────────────
-
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+load_dotenv(override=True)
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY",   "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 _groq_client  = None
 _gemini_model = None
@@ -42,74 +28,80 @@ _gemini_model = None
 def _get_groq_client():
     global _groq_client
     if _groq_client is None and GROQ_API_KEY:
-        from groq import Groq
-        # Explicitly disable proxies to avoid httpx proxy issues
-        _groq_client = Groq(api_key=GROQ_API_KEY)
+        try:
+            from groq import Groq
+            import httpx
+            # FIX #3: pass explicit httpx client to avoid proxy detection crash
+            _groq_client = Groq(
+                api_key=GROQ_API_KEY,
+                http_client=httpx.Client(timeout=30.0, follow_redirects=True)
+            )
+            logger.info("[LLM] Groq client initialized.")
+        except Exception as e:
+            logger.error(f"[LLM] Groq init failed: {e}")
     return _groq_client
 
 
 def _get_gemini_model():
     global _gemini_model
     if _gemini_model is None and GEMINI_API_KEY:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        _gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=GEMINI_API_KEY)
+            _gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+            logger.info("[LLM] Gemini model initialized.")
+        except Exception as e:
+            logger.error(f"[LLM] Gemini init failed: {e}")
     return _gemini_model
 
 
 def _call_llm(system_prompt: str, user_message: str,
               temperature: float = 0.1, max_tokens: int = 1024) -> str:
-    """
-    Unified LLM caller. Tries Groq (Llama-3.1) first, falls back to Gemini.
-    Low temperature enforces factual, deterministic responses.
-    """
-    # Try Groq
-    groq = _get_groq_client()
-    if groq:
-        try:
-            response = groq.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_message},
-                ],
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.warning(f"[LLM] Groq failed: {e}. Trying Gemini.")
-            logger.warning(f"[LLM] Groq error type: {type(e).__name__}")
+    if not GROQ_API_KEY and not GEMINI_API_KEY:
+        raise RuntimeError(
+            "No API keys configured. Add GROQ_API_KEY or GEMINI_API_KEY to backend/.env"
+        )
 
-    # Try Gemini
-    gemini = _get_gemini_model()
-    if gemini:
-        try:
-            full_prompt = f"{system_prompt}\n\nUser: {user_message}"
-            response = gemini.generate_content(full_prompt)
-            return response.text.strip()
-        except Exception as e:
-            logger.error(f"[LLM] Gemini also failed: {e}")
-            logger.error(f"[LLM] Gemini error type: {type(e).__name__}")
-            raise RuntimeError("Both LLM providers failed. Check your API keys.")
+    # Try Groq first
+    if GROQ_API_KEY:
+        groq = _get_groq_client()
+        if groq:
+            try:
+                response = groq.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": user_message},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                logger.warning(f"[LLM] Groq failed ({type(e).__name__}: {e}), trying Gemini.")
 
-    raise RuntimeError(
-        "No LLM provider configured. Set GROQ_API_KEY or GEMINI_API_KEY in .env"
-    )
+    # Fallback to Gemini
+    if GEMINI_API_KEY:
+        gemini = _get_gemini_model()
+        if gemini:
+            try:
+                response = gemini.generate_content(f"{system_prompt}\n\nUser: {user_message}")
+                return response.text.strip()
+            except Exception as e:
+                raise RuntimeError(f"Both LLM providers failed. Last error: {e}")
+
+    raise RuntimeError("No LLM provider available. Check your API keys in backend/.env")
 
 
-# ─────────────────────────────────────────────────────────────
-# Intent Classification
-# ─────────────────────────────────────────────────────────────
+# ── Intent Classification ──────────────────────────────────────
 
 class QueryIntent(str, Enum):
-    ACADEMIC = "academic"   # Personal data queries → SQL Agent
-    POLICY   = "policy"     # Policy/rule queries   → RAG Agent
-    HYBRID   = "hybrid"     # Needs both agents
-    GREETING = "greeting"   # Greetings/small talk
+    ACADEMIC = "academic"
+    POLICY   = "policy"
+    HYBRID   = "hybrid"
+    GREETING = "greeting"
 
 
-# Fast keyword patterns — avoid LLM call for obvious cases
 _ACADEMIC_KW = [
     "my gpa", "my cgpa", "my grade", "my attendance", "my marks",
     "my courses", "my enrollment", "my score", "my result",
@@ -137,7 +129,6 @@ _GREETING_KW = [
     "good evening", "thanks", "thank you", "bye", "goodbye",
 ]
 
-# Hybrid patterns: personal + policy overlap
 _HYBRID_PATTERNS = [
     r"am i (on probation|at risk|going to fail|eligible for medal)",
     r"will i (be dropped|get xf|fail|qualify for)",
@@ -148,40 +139,23 @@ _HYBRID_PATTERNS = [
 
 
 def classify_intent(query: str) -> QueryIntent:
-    """
-    Two-stage classifier:
-      Stage 1 — Keyword matching (zero LLM cost, instant)
-      Stage 2 — LLM classification (only for ambiguous queries)
-    """
     q = query.lower().strip()
-
-    # Greeting check first
     if any(kw in q for kw in _GREETING_KW) and len(q) < 60:
         return QueryIntent.GREETING
-
     academic_hit = any(kw in q for kw in _ACADEMIC_KW)
     policy_hit   = any(kw in q for kw in _POLICY_KW)
-
-    # Hybrid pattern check
     if any(re.search(p, q) for p in _HYBRID_PATTERNS):
         return QueryIntent.HYBRID
-
-    # Clear wins
     if academic_hit and not policy_hit:
         return QueryIntent.ACADEMIC
     if policy_hit and not academic_hit:
         return QueryIntent.POLICY
-
-    # Ambiguous — use LLM
     if academic_hit and policy_hit:
         return _llm_classify(query)
-
-    # Default to POLICY (safer than exposing DB)
     return QueryIntent.POLICY
 
 
 def _llm_classify(query: str) -> QueryIntent:
-    """LLM-based intent disambiguation for edge cases."""
     prompt = (
         "Classify this university student query into ONE category:\n"
         "ACADEMIC = personal data (GPA, grades, attendance, enrolled courses)\n"
@@ -190,27 +164,17 @@ def _llm_classify(query: str) -> QueryIntent:
         "Respond with ONLY one word: ACADEMIC, POLICY, or HYBRID."
     )
     try:
-        result = _call_llm(prompt, query, temperature=0.0, max_tokens=10)
-        result = result.strip().upper()
-        if "ACADEMIC" in result:
-            return QueryIntent.ACADEMIC
-        elif "HYBRID" in result:
-            return QueryIntent.HYBRID
-        else:
-            return QueryIntent.POLICY
+        result = _call_llm(prompt, query, temperature=0.0, max_tokens=10).upper()
+        if "ACADEMIC" in result: return QueryIntent.ACADEMIC
+        if "HYBRID"   in result: return QueryIntent.HYBRID
+        return QueryIntent.POLICY
     except Exception:
         return QueryIntent.POLICY
 
 
-# ─────────────────────────────────────────────────────────────
-# SQL Agent
-# ─────────────────────────────────────────────────────────────
+# ── SQL Agent ──────────────────────────────────────────────────
 
 def _build_sql_system_prompt(student_id: str) -> str:
-    """
-    Context Engineering: injects the full DB schema + student_id
-    so the LLM can generate valid Zero-Shot SQL.
-    """
     schema = get_schema()
     return f"""You are an expert SQLite query generator for a university student information system.
 Your ONLY job is to produce a single valid SELECT statement.
@@ -255,77 +219,37 @@ Write a clear, friendly response:
 
 
 def run_sql_agent(query: str, student_id: str) -> dict:
-    """
-    SQL Agent:
-      1. Build schema-injected system prompt
-      2. LLM generates Zero-Shot SQL
-      3. Sanitize and execute (read-only)
-      4. LLM formats results into natural language
-    """
     system_prompt = _build_sql_system_prompt(student_id)
-
-    # Step 1: Generate SQL
     try:
         raw_sql = _call_llm(system_prompt, query, temperature=0.0, max_tokens=300)
     except Exception as e:
-        return {
-            "intent": "academic", "answer": f"AI service unavailable: {e}",
-            "sql": None, "data": None, "error": str(e),
-        }
+        return {"intent": "academic", "answer": f"❌ AI service unavailable: {e}\n\nCheck that GROQ_API_KEY or GEMINI_API_KEY is set in backend/.env", "sql": None, "data": None, "error": str(e)}
 
     sql = _extract_sql(raw_sql)
     logger.info(f"[SQL Agent] Generated: {sql}")
 
-    # Step 2: Execute (read-only guard inside execute_read_query)
     try:
         rows = execute_read_query(sql)
     except ValueError as e:
-        return {
-            "intent": "academic",
-            "answer": "Security restriction: that query type is not permitted.",
-            "sql": sql, "data": None, "error": str(e),
-        }
+        return {"intent": "academic", "answer": "Security restriction: that query type is not permitted.", "sql": sql, "data": None, "error": str(e)}
     except Exception as e:
         logger.error(f"[SQL Agent] DB error: {e}")
-        return {
-            "intent": "academic",
-            "answer": "I had trouble retrieving your data. Please try again.",
-            "sql": sql, "data": None, "error": str(e),
-        }
+        return {"intent": "academic", "answer": "I had trouble retrieving your data. Please try again.", "sql": sql, "data": None, "error": str(e)}
 
     if not rows:
-        return {
-            "intent": "academic",
-            "answer": "No records found for your query. "
-                      "This semester's data may not be available yet.",
-            "sql": sql, "data": [], "error": None,
-        }
+        return {"intent": "academic", "answer": "No records found for your query. This semester's data may not be available yet.", "sql": sql, "data": [], "error": None}
 
-    # Step 3: Format results as natural language
-    data_str = json.dumps(rows, indent=2)
+    data_str   = json.dumps(rows, indent=2)
     fmt_prompt = _SQL_FORMAT_PROMPT.format(query=query, data=data_str)
-
     try:
-        answer = _call_llm(
-            "You are IM|Copilot, a friendly academic assistant for IMSciences.",
-            fmt_prompt,
-            temperature=0.3,
-            max_tokens=600
-        )
+        answer = _call_llm("You are IM|Copilot, a friendly academic assistant for IMSciences.", fmt_prompt, temperature=0.3, max_tokens=600)
     except Exception:
         answer = f"Here is your requested data:\n\n{data_str}"
 
-    return {
-        "intent": "academic",
-        "answer": answer,
-        "sql":    sql,
-        "data":   rows,
-        "error":  None,
-    }
+    return {"intent": "academic", "answer": answer, "sql": sql, "data": rows, "error": None}
 
 
 def _extract_sql(raw: str) -> str:
-    """Strips markdown fences and extracts the SQL SELECT statement."""
     raw = re.sub(r"```sql", "", raw, flags=re.IGNORECASE)
     raw = re.sub(r"```",    "", raw)
     match = re.search(r"(SELECT\b.+?)(?:;|$)", raw, re.IGNORECASE | re.DOTALL)
@@ -335,9 +259,7 @@ def _extract_sql(raw: str) -> str:
     return raw.strip()
 
 
-# ─────────────────────────────────────────────────────────────
-# RAG Agent
-# ─────────────────────────────────────────────────────────────
+# ── RAG Agent ──────────────────────────────────────────────────
 
 _RAG_SYSTEM_PROMPT = """You are IM|Copilot, the official AI assistant for the Institute of Management Sciences (IMSciences), Peshawar.
 
@@ -376,26 +298,14 @@ Instructions:
 
 def run_rag_agent(query: str, student_id: Optional[str] = None,
                   student_data: Optional[list] = None) -> dict:
-    """
-    RAG Agent:
-      1. Embed query → retrieve top-4 handbook chunks from ChromaDB
-      2. Format chunks into context block
-      3. Inject context into system prompt
-      4. LLM generates grounded, cited answer
-    """
     try:
         chunks      = retrieve_context(query, top_k=4)
         context_str = build_rag_context_string(chunks)
     except Exception as e:
-        # Fallback when ChromaDB is not available
-        logger.warning(f"RAG Agent fallback: ChromaDB unavailable ({e})")
-        return {
-            "intent":  "policy" if not student_data else "hybrid",
-            "answer":  "I'm sorry, but the handbook search feature is currently unavailable due to a technical issue. Please try asking about your academic records instead.",
-            "chunks":  [],
-            "context": "",
-            "error":   f"Vector store unavailable: {str(e)}",
-        }
+        logger.warning(f"[RAG] ChromaDB unavailable ({e}), using inline fallback.")
+        from vector_store import HANDBOOK_INLINE_TEXT
+        context_str = HANDBOOK_INLINE_TEXT
+        chunks = []
 
     if student_data:
         system_prompt = _RAG_HYBRID_PROMPT.format(
@@ -411,38 +321,21 @@ def run_rag_agent(query: str, student_id: Optional[str] = None,
     try:
         answer = _call_llm(system_prompt, user_message, temperature=0.2, max_tokens=800)
     except Exception as e:
-        return {
-            "intent":  "policy",
-            "answer":  f"AI service unavailable. Please try again. ({e})",
-            "chunks":  chunks,
-            "context": context_str,
-            "error":   str(e),
-        }
+        return {"intent": "policy", "answer": f"❌ AI service unavailable: {e}\n\nCheck that GROQ_API_KEY or GEMINI_API_KEY is set in backend/.env", "chunks": chunks, "context": context_str, "error": str(e)}
 
     return {
         "intent":  "policy" if not student_data else "hybrid",
         "answer":  answer,
-        "chunks":  [{"rank": c["rank"], "source": c["source"],
-                     "distance": c["distance"]} for c in chunks],
+        "chunks":  [{"rank": c["rank"], "source": c["source"], "distance": c["distance"]} for c in chunks],
         "context": context_str,
         "error":   None,
     }
 
 
-# ─────────────────────────────────────────────────────────────
-# Hybrid Agent
-# ─────────────────────────────────────────────────────────────
+# ── Hybrid Agent ───────────────────────────────────────────────
 
 def run_hybrid_agent(query: str, student_id: str) -> dict:
-    """
-    Combines SQL + RAG:
-      1. Fetch relevant student data via SQL Agent
-      2. Feed that data + policy chunks into RAG Agent
-      3. Return personalized policy-aware answer
-    """
     q = query.lower()
-
-    # Choose the most relevant SQL sub-query
     if any(w in q for w in ["probation", "cgpa", "gpa", "dropped"]):
         sub_query = "What is my current CGPA and program?"
     elif any(w in q for w in ["attendance", "xf", "absent"]):
@@ -454,12 +347,7 @@ def run_hybrid_agent(query: str, student_id: str) -> dict:
 
     sql_result   = run_sql_agent(sub_query, student_id)
     student_data = sql_result.get("data", [])
-
-    rag_result = run_rag_agent(
-        query,
-        student_id=student_id,
-        student_data=student_data,
-    )
+    rag_result   = run_rag_agent(query, student_id=student_id, student_data=student_data)
 
     return {
         "intent": "hybrid",
@@ -471,9 +359,7 @@ def run_hybrid_agent(query: str, student_id: str) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────
-# Greeting Handler
-# ─────────────────────────────────────────────────────────────
+# ── Greeting Handler ───────────────────────────────────────────
 
 _GREETING_PROMPT = """You are IM|Copilot, a friendly AI academic assistant for IMSciences Peshawar.
 Greet the student warmly in 2-3 sentences. Mention you can help with:
@@ -493,46 +379,21 @@ def run_greeting_handler(query: str) -> dict:
     return {"intent": "greeting", "answer": answer, "error": None}
 
 
-# ─────────────────────────────────────────────────────────────
-# Main Router — Public Entry Point
-# ─────────────────────────────────────────────────────────────
+# ── Main Router ────────────────────────────────────────────────
 
 def process_query(query: str, student_id: str) -> dict:
-    """
-    Central entry point for all chat queries.
-
-    Args:
-        query:      Natural language question from the student.
-        student_id: Authenticated student ID (e.g., 'S001').
-
-    Returns:
-        dict with keys: intent, answer, and agent-specific metadata.
-    """
     if not query or not query.strip():
-        return {
-            "intent": "error",
-            "answer": "Please enter a valid question.",
-            "error":  "Empty query",
-        }
+        return {"intent": "error", "answer": "Please enter a valid question.", "error": "Empty query"}
 
     intent = classify_intent(query)
     logger.info(f"[Router] '{query[:55]}' → {intent.value.upper()}")
 
-    if intent == QueryIntent.GREETING:
-        return run_greeting_handler(query)
-    elif intent == QueryIntent.ACADEMIC:
-        return run_sql_agent(query, student_id)
-    elif intent == QueryIntent.POLICY:
-        return run_rag_agent(query)
-    elif intent == QueryIntent.HYBRID:
-        return run_hybrid_agent(query, student_id)
-    else:
-        return run_rag_agent(query)
+    if   intent == QueryIntent.GREETING: return run_greeting_handler(query)
+    elif intent == QueryIntent.ACADEMIC: return run_sql_agent(query, student_id)
+    elif intent == QueryIntent.POLICY:   return run_rag_agent(query)
+    elif intent == QueryIntent.HYBRID:   return run_hybrid_agent(query, student_id)
+    else:                                return run_rag_agent(query)
 
-
-# ─────────────────────────────────────────────────────────────
-# Self-test
-# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     tests = [
@@ -545,7 +406,6 @@ if __name__ == "__main__":
         ("Can I freeze my semester?",                   "POLICY"),
         ("Do I qualify for gold medal?",                "HYBRID"),
     ]
-
     print("=" * 55)
     print("IM|Copilot — Intent Router Test Suite")
     print("=" * 55)
@@ -554,7 +414,6 @@ if __name__ == "__main__":
         intent = classify_intent(q)
         got    = intent.value.upper()
         status = "PASS" if got == expected else "FAIL"
-        if status == "PASS":
-            passed += 1
+        if status == "PASS": passed += 1
         print(f"  [{status}] {q[:45]:<45} → {got}")
     print(f"\nResult: {passed}/{len(tests)} passed")
