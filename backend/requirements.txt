@@ -1,0 +1,24 @@
+# IM|Copilot Backend — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Web Framework ──────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+
+# ── LLM Providers ─────────────────────────────────────────
+groq==0.8.0               # Groq API (Llama-3) — primary fast inference
+google-generativeai==0.5.4 # Google Gemini — fallback
+
+# ── Vector Store & Embeddings ─────────────────────────────
+chromadb==0.4.24          # Older version compatible with NumPy < 2.0
+sentence-transformers==2.7.0
+
+# ── Data & Utilities ──────────────────────────────────────
+pydantic==2.7.1
+python-dotenv==1.0.1
+numpy<2.0                  # Explicit NumPy version constraint
+
+# ── Optional: LangGraph for advanced orchestration ────────
+# langgraph==0.1.0
+# langchain-core==0.2.0
