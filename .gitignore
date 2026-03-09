@@ -11,4 +11,9 @@ frontend/dist/
 .DS_Store
 
 # Sensitive Keys (if you have them)
-.env
+.envbackend/*.db
+backend/chroma_db/
+backend/venv/
+backend/status:*
+backend/service:*
+backend/version:*
