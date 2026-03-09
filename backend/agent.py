@@ -17,7 +17,6 @@ from vector_store import retrieve_context, build_rag_context_string
 
 logger = logging.getLogger(__name__)
 
-load_dotenv(override=True)
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY",   "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 

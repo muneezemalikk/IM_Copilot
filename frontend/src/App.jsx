@@ -4,7 +4,7 @@ import {
   Send, Bot, User, AlertTriangle, CheckCircle,
   TrendingUp, Clock, ChevronRight, Loader2,
   LogOut, Bell, Shield, Zap, Database, Search,
-  ChevronDown, X, Menu
+  ChevronDown, X, Menu, Lock, Eye, EyeOff
 } from "lucide-react";
 import {
   RadialBarChart, RadialBar, ResponsiveContainer,
@@ -103,10 +103,18 @@ const FontLoader = () => (
       0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
       40%            { transform: scale(1);   opacity: 1;   }
     }
+    @keyframes shakeX {
+      0%, 100% { transform: translateX(0); }
+      20%       { transform: translateX(-6px); }
+      40%       { transform: translateX(6px); }
+      60%       { transform: translateX(-4px); }
+      80%       { transform: translateX(4px); }
+    }
 
     .fade-up   { animation: fadeUp  0.35s ease both; }
     .fade-in   { animation: fadeIn  0.25s ease both; }
     .slide-in  { animation: slideIn 0.3s  ease both; }
+    .shake     { animation: shakeX 0.4s ease both; }
 
     .card {
       background: var(--surface);
@@ -144,22 +152,74 @@ const FontLoader = () => (
       font-weight: 600;
       letter-spacing: 0.03em;
     }
+
+    /* Login input focus glow */
+    .login-input:focus {
+      border-color: var(--accent) !important;
+      box-shadow: 0 0 0 3px rgba(79,142,247,0.15);
+    }
   `}</style>
 );
 
+// ─── Role Badge ─────────────────────────────────────────────
+function RoleBadge({ role }) {
+  const isAdmin = role === "admin";
+  return (
+    <span className="chip" style={{
+      background: isAdmin ? "#7c3aed20" : "#4f8ef720",
+      color: isAdmin ? "#a78bfa" : "var(--accent)",
+      border: `1px solid ${isAdmin ? "#7c3aed40" : "#4f8ef740"}`,
+      fontSize: 10,
+      textTransform: "uppercase",
+      letterSpacing: "0.08em",
+    }}>
+      {isAdmin ? <Shield size={9} /> : <GraduationCap size={9} />}
+      {isAdmin ? "Admin" : "Student"}
+    </span>
+  );
+}
+
 // ─── Login Screen ───────────────────────────────────────────
 function LoginScreen({ onLogin }) {
-  const [students, setStudents] = useState([]);
-  const [selected, setSelected] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [open, setOpen] = useState(false);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPw,   setShowPw]   = useState(false);
+  const [loading,  setLoading]  = useState(false);
+  const [error,    setError]    = useState("");
+  const [shake,    setShake]    = useState(false);
 
-  useEffect(() => {
-    fetch(`${API_BASE}/students`)
-      .then(r => r.json())
-      .then(d => { setStudents(d.students || []); setLoading(false); })
-      .catch(() => setLoading(false));
-  }, []);
+  const triggerShake = () => {
+    setShake(true);
+    setTimeout(() => setShake(false), 450);
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!username.trim() || !password.trim()) return;
+    setError("");
+    setLoading(true);
+
+    try {
+      const res  = await fetch(`${API_BASE}/login`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ username: username.trim(), password: password.trim() }),
+      });
+      const data = await res.json();
+
+      if (data.success) {
+        onLogin(data); // { username, role, student_id }
+      } else {
+        setError("Invalid username or password.");
+        triggerShake();
+      }
+    } catch {
+      setError("Cannot reach server — is the backend running on :8000?");
+      triggerShake();
+    } finally {
+      setLoading(false);
+    }
+  };
 
   return (
     <div style={{
@@ -167,9 +227,10 @@ function LoginScreen({ onLogin }) {
       justifyContent: "center", padding: 24,
       background: "radial-gradient(ellipse 80% 60% at 50% -10%, #1a2340 0%, var(--bg) 70%)"
     }}>
-      <div className="fade-up" style={{ width: "100%", maxWidth: 420 }}>
+      <div className="fade-up" style={{ width: "100%", maxWidth: 400 }}>
+
         {/* Logo */}
-        <div style={{ textAlign: "center", marginBottom: 40 }}>
+        <div style={{ textAlign: "center", marginBottom: 36 }}>
           <div style={{
             display: "inline-flex", alignItems: "center", justifyContent: "center",
             width: 64, height: 64, borderRadius: 18,
@@ -187,81 +248,149 @@ function LoginScreen({ onLogin }) {
         </div>
 
         {/* Card */}
-        <div className="card" style={{ padding: 28 }}>
-          <p style={{ fontSize: 12, fontWeight: 600, letterSpacing: "0.08em", color: "var(--text3)", textTransform: "uppercase", marginBottom: 12 }}>
-            Select Student Account
+        <div className={`card ${shake ? "shake" : ""}`} style={{ padding: 28 }}>
+          <p style={{
+            fontSize: 12, fontWeight: 600, letterSpacing: "0.08em",
+            color: "var(--text3)", textTransform: "uppercase", marginBottom: 20
+          }}>
+            Sign in to your account
           </p>
 
-          {/* Dropdown */}
-          <div style={{ position: "relative" }}>
-            <button
-              onClick={() => setOpen(o => !o)}
-              style={{
-                width: "100%", display: "flex", alignItems: "center",
-                justifyContent: "space-between",
-                background: "var(--surface2)", border: "1px solid var(--border2)",
-                borderRadius: 10, padding: "12px 14px", color: "var(--text)",
-                fontSize: 14, transition: "border-color 0.15s"
-              }}
-            >
-              {selected
-                ? <span>{selected.name} <span style={{ color: "var(--text2)" }}>· {selected.program}</span></span>
-                : <span style={{ color: "var(--text2)" }}>Choose a student…</span>
-              }
-              <ChevronDown size={16} color="var(--text2)" style={{
-                transform: open ? "rotate(180deg)" : "none", transition: "transform 0.2s"
-              }} />
-            </button>
+          <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
 
-            {open && (
+            {/* Username */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <label style={{ fontSize: 12, fontWeight: 600, color: "var(--text2)" }}>
+                Username
+              </label>
+              <input
+                className="login-input"
+                type="text"
+                value={username}
+                onChange={e => setUsername(e.target.value)}
+                placeholder="e.g. S001 or admin"
+                autoFocus
+                required
+                style={{
+                  padding: "11px 14px",
+                  background: "var(--surface2)",
+                  border: "1px solid var(--border2)",
+                  borderRadius: 10,
+                  color: "var(--text)",
+                  fontSize: 14,
+                  outline: "none",
+                  transition: "border-color 0.15s, box-shadow 0.15s",
+                  fontFamily: "DM Mono, monospace",
+                }}
+              />
+            </div>
+
+            {/* Password */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <label style={{ fontSize: 12, fontWeight: 600, color: "var(--text2)" }}>
+                Password
+              </label>
+              <div style={{ position: "relative" }}>
+                <input
+                  className="login-input"
+                  type={showPw ? "text" : "password"}
+                  value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  placeholder="Enter your password"
+                  required
+                  style={{
+                    width: "100%",
+                    padding: "11px 42px 11px 14px",
+                    background: "var(--surface2)",
+                    border: "1px solid var(--border2)",
+                    borderRadius: 10,
+                    color: "var(--text)",
+                    fontSize: 14,
+                    outline: "none",
+                    transition: "border-color 0.15s, box-shadow 0.15s",
+                    fontFamily: "DM Sans, sans-serif",
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPw(v => !v)}
+                  style={{
+                    position: "absolute", right: 12, top: "50%",
+                    transform: "translateY(-50%)",
+                    background: "none", color: "var(--text3)",
+                    display: "flex", alignItems: "center",
+                    padding: 2,
+                  }}
+                >
+                  {showPw ? <EyeOff size={15} /> : <Eye size={15} />}
+                </button>
+              </div>
+            </div>
+
+            {/* Error */}
+            {error && (
               <div className="fade-in" style={{
-                position: "absolute", top: "calc(100% + 6px)", left: 0, right: 0,
-                background: "var(--surface2)", border: "1px solid var(--border2)",
-                borderRadius: 10, overflow: "hidden", zIndex: 100,
-                boxShadow: "0 12px 40px rgba(0,0,0,0.5)"
+                display: "flex", alignItems: "center", gap: 8,
+                padding: "10px 14px",
+                background: "#ef444412",
+                border: "1px solid #ef444430",
+                borderRadius: 9,
+                color: "#f87171",
+                fontSize: 13,
               }}>
-                {loading
-                  ? <div style={{ padding: 16, color: "var(--text2)", textAlign: "center" }}>Loading…</div>
-                  : students.map((s, i) => (
-                    <button
-                      key={s.student_id}
-                      onClick={() => { setSelected(s); setOpen(false); }}
-                      style={{
-                        width: "100%", display: "flex", alignItems: "center",
-                        justifyContent: "space-between",
-                        padding: "10px 14px", background: selected?.student_id === s.student_id ? "var(--border)" : "transparent",
-                        color: "var(--text)", fontSize: 13,
-                        borderBottom: i < students.length - 1 ? "1px solid var(--border)" : "none",
-                        transition: "background 0.1s"
-                      }}
-                      onMouseEnter={e => e.currentTarget.style.background = "var(--border)"}
-                      onMouseLeave={e => e.currentTarget.style.background = selected?.student_id === s.student_id ? "var(--border)" : "transparent"}
-                    >
-                      <span>{s.name}</span>
-                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                        <span className="chip" style={{ background: "#1e293b", color: "var(--text2)" }}>{s.program}</span>
-                        <span style={{ fontFamily: "DM Mono", fontSize: 12, color: "var(--accent)" }}>
-                          {s.cgpa?.toFixed(2)}
-                        </span>
-                      </div>
-                    </button>
-                  ))
-                }
+                <AlertTriangle size={14} />
+                {error}
               </div>
             )}
-          </div>
 
-          <button
-            className="btn-primary"
-            onClick={() => selected && onLogin(selected.student_id)}
-            disabled={!selected}
-            style={{ width: "100%", marginTop: 16, padding: "12px", fontSize: 14 }}
-          >
-            Enter Dashboard
-          </button>
+            {/* Submit */}
+            <button
+              type="submit"
+              className="btn-primary"
+              disabled={loading || !username.trim() || !password.trim()}
+              style={{
+                width: "100%", padding: "12px",
+                fontSize: 14, marginTop: 4,
+                display: "flex", alignItems: "center",
+                justifyContent: "center", gap: 8,
+                background: "linear-gradient(135deg, #4f8ef7, #7c3aed)",
+              }}
+            >
+              {loading
+                ? <><Loader2 size={16} style={{ animation: "spin 1s linear infinite" }} /> Signing in…</>
+                : <><Lock size={15} /> Sign In</>
+              }
+            </button>
+          </form>
         </div>
 
-        <p style={{ textAlign: "center", marginTop: 20, fontSize: 11, color: "var(--text3)" }}>
+        {/* Credentials hint */}
+        <div style={{
+          marginTop: 16,
+          padding: "14px 16px",
+          background: "var(--surface)",
+          border: "1px solid var(--border)",
+          borderRadius: 10,
+          fontSize: 12,
+          color: "var(--text3)",
+          lineHeight: 1.8,
+        }}>
+          <div style={{ fontWeight: 600, color: "var(--text2)", marginBottom: 6 }}>
+            Demo credentials
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span>Students</span>
+              <span className="mono" style={{ color: "var(--text2)" }}>S001 / ali123 &nbsp;·&nbsp; S002 / fatima123</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span>Admin</span>
+              <span className="mono" style={{ color: "#a78bfa" }}>admin / admin123</span>
+            </div>
+          </div>
+        </div>
+
+        <p style={{ textAlign: "center", marginTop: 16, fontSize: 11, color: "var(--text3)" }}>
           Demo build · FYP-1 · Institute of Management Sciences
         </p>
       </div>
@@ -461,7 +590,6 @@ function ChatMessage({ msg }) {
 
       {/* Bubble */}
       <div style={{ maxWidth: "72%", minWidth: 60 }}>
-        {/* Intent badge */}
         {badge && (
           <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 6 }}>
             <span className="chip" style={{
@@ -497,7 +625,6 @@ function ChatMessage({ msg }) {
           {msg.content}
         </div>
 
-        {/* SQL disclosure */}
         {msg.metadata?.sql_generated && (
           <details style={{ marginTop: 6 }}>
             <summary style={{
@@ -753,7 +880,7 @@ function ChatView({ studentId, studentName }) {
         <div ref={bottomRef} />
       </div>
 
-      {/* Suggestions (show when only 1 message) */}
+      {/* Suggestions */}
       {messages.length <= 1 && (
         <div className="fade-up" style={{ paddingBottom: 14 }}>
           <p style={{ fontSize: 11, color: "var(--text3)", marginBottom: 8, letterSpacing: "0.06em", textTransform: "uppercase", fontWeight: 600 }}>
@@ -817,27 +944,36 @@ function ChatView({ studentId, studentName }) {
 
 // ─── Main App ───────────────────────────────────────────────
 export default function App() {
-  const [studentId, setStudentId]   = useState(null);
-  const [dashboard, setDashboard]   = useState(null);
-  const [activeTab, setActiveTab]   = useState("dashboard");
-  const [loadingDB, setLoadingDB]   = useState(false);
-  const [dbError, setDbError]       = useState(null);
+  // user = { username, role, student_id } after login
+  const [user,      setUser]      = useState(null);
+  const [dashboard, setDashboard] = useState(null);
+  const [activeTab, setActiveTab] = useState("dashboard");
+  const [loadingDB, setLoadingDB] = useState(false);
+  const [dbError,   setDbError]   = useState(null);
 
-  // Fetch dashboard on login
+  // Fetch dashboard after login (students only)
   useEffect(() => {
-    if (!studentId) return;
+    if (!user || user.role === "admin" || !user.student_id) return;
     setLoadingDB(true);
     setDbError(null);
-    fetch(`${API_BASE}/dashboard/${studentId}`)
+    fetch(`${API_BASE}/dashboard/${user.student_id}`)
       .then(r => r.json())
       .then(d => { setDashboard(d); setLoadingDB(false); })
       .catch(e => { setDbError(e.message); setLoadingDB(false); });
-  }, [studentId]);
+  }, [user]);
 
-  if (!studentId) return <><FontLoader /><LoginScreen onLogin={setStudentId} /></>;
+  const handleLogout = () => {
+    setUser(null);
+    setDashboard(null);
+    setActiveTab("dashboard");
+  };
+
+  // ── Not logged in ───────────────────────────────────────
+  if (!user) return <><FontLoader /><LoginScreen onLogin={setUser} /></>;
 
   const student = dashboard?.student;
   const cgpa    = student?.cgpa ?? 0;
+  const isAdmin = user.role === "admin";
 
   const tabs = [
     { id: "dashboard", label: "Dashboard", icon: BarChart2 },
@@ -869,32 +1005,42 @@ export default function App() {
             </span>
           </div>
 
-          {/* Student mini-profile */}
-          {student && (
-            <div style={{
-              padding: "12px", borderRadius: 10,
-              background: "var(--surface2)", border: "1px solid var(--border)",
-              marginBottom: 20
-            }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)", marginBottom: 4 }}>
-                {student.name}
+          {/* User mini-profile */}
+          <div style={{
+            padding: "12px",
+            borderRadius: 10,
+            background: "var(--surface2)",
+            border: "1px solid var(--border)",
+            marginBottom: 20
+          }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>
+                {isAdmin ? "Administrator" : (student?.name ?? user.username)}
               </div>
-              <div style={{ display: "flex", gap: 6 }}>
+              <RoleBadge role={user.role} />
+            </div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {!isAdmin && student && (
                 <span className="chip" style={{ background: "#4f8ef720", color: "var(--accent)", fontSize: 10 }}>
                   {student.program}
                 </span>
+              )}
+              <span className="chip mono" style={{ background: "var(--border)", color: "var(--text3)", fontSize: 10 }}>
+                {user.username}
+              </span>
+              {!isAdmin && (
                 <span className="chip mono" style={{ background: "var(--border)", color: "var(--text2)", fontSize: 10 }}>
                   {cgpa.toFixed(2)}
                 </span>
-              </div>
+              )}
             </div>
-          )}
+          </div>
 
           {/* Nav */}
           <nav style={{ flex: 1 }}>
             {tabs.map(t => {
-              const Icon    = t.icon;
-              const active  = activeTab === t.id;
+              const Icon   = t.icon;
+              const active = activeTab === t.id;
               return (
                 <button key={t.id} onClick={() => setActiveTab(t.id)} style={{
                   width: "100%", display: "flex", alignItems: "center", gap: 10,
@@ -922,7 +1068,7 @@ export default function App() {
               <div style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--success)" }} />
               <span style={{ fontSize: 11, color: "var(--success)" }}>API Connected</span>
             </div>
-            <button onClick={() => { setStudentId(null); setDashboard(null); }} style={{
+            <button onClick={handleLogout} style={{
               width: "100%", display: "flex", alignItems: "center", gap: 8,
               padding: "8px 12px", borderRadius: 9, color: "var(--text3)",
               fontSize: 13, background: "transparent", transition: "all 0.15s"
@@ -951,7 +1097,7 @@ export default function App() {
               </h1>
               <p style={{ fontSize: 11, color: "var(--text3)" }}>
                 {activeTab === "dashboard"
-                  ? `${dashboard?.semester_label ?? "—"} · ${student?.program ?? ""}`
+                  ? `${dashboard?.semester_label ?? "—"} · ${student?.program ?? (isAdmin ? "Admin View" : "")}`
                   : "Powered by Llama-3 + RAG · IMSciences Handbook"
                 }
               </p>
@@ -969,8 +1115,9 @@ export default function App() {
                 </div>
               )}
               <div style={{ width: 1, height: 20, background: "var(--border)" }} />
+              <RoleBadge role={user.role} />
               <span style={{ fontSize: 12, color: "var(--text3)", fontFamily: "DM Mono" }}>
-                {studentId}
+                {user.username}
               </span>
             </div>
           </header>
@@ -978,28 +1125,43 @@ export default function App() {
           {/* Content area */}
           <div style={{ flex: 1, overflowY: "auto", padding: "24px 28px" }}>
             {activeTab === "dashboard" && (
-              loadingDB
-                ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center",
+              isAdmin
+                ? (
+                  // Admin placeholder — extend later
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center",
                     height: "60vh", flexDirection: "column", gap: 14 }}>
-                    <Loader2 size={28} color="var(--accent)" style={{ animation: "spin 1s linear infinite" }} />
-                    <p style={{ color: "var(--text2)", fontSize: 13 }}>Loading your dashboard…</p>
+                    <Shield size={40} color="var(--accent2)" />
+                    <p style={{ color: "var(--text)", fontSize: 16, fontWeight: 600 }}>Admin Dashboard</p>
+                    <p style={{ color: "var(--text2)", fontSize: 13 }}>
+                      Student management features coming soon.
+                    </p>
                   </div>
-                : dbError
+                )
+                : loadingDB
                   ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center",
-                      height: "60vh", flexDirection: "column", gap: 12 }}>
-                      <AlertTriangle size={28} color="var(--danger)" />
-                      <p style={{ color: "var(--text2)", fontSize: 13 }}>
-                        Could not load dashboard. Is the backend running?
-                      </p>
-                      <code style={{ fontSize: 11, color: "var(--text3)", fontFamily: "DM Mono" }}>
-                        {dbError}
-                      </code>
+                      height: "60vh", flexDirection: "column", gap: 14 }}>
+                      <Loader2 size={28} color="var(--accent)" style={{ animation: "spin 1s linear infinite" }} />
+                      <p style={{ color: "var(--text2)", fontSize: 13 }}>Loading your dashboard…</p>
                     </div>
-                  : dashboard && <DashboardView data={dashboard} />
+                  : dbError
+                    ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center",
+                        height: "60vh", flexDirection: "column", gap: 12 }}>
+                        <AlertTriangle size={28} color="var(--danger)" />
+                        <p style={{ color: "var(--text2)", fontSize: 13 }}>
+                          Could not load dashboard. Is the backend running?
+                        </p>
+                        <code style={{ fontSize: 11, color: "var(--text3)", fontFamily: "DM Mono" }}>
+                          {dbError}
+                        </code>
+                      </div>
+                    : dashboard && <DashboardView data={dashboard} />
             )}
             {activeTab === "chat" && (
               <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-                <ChatView studentId={studentId} studentName={student?.name ?? "Student"} />
+                <ChatView
+                  studentId={user.student_id}
+                  studentName={isAdmin ? "Admin" : (student?.name ?? user.username)}
+                />
               </div>
             )}
           </div>

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from database import initialize_database, get_student_dashboard, execute_read_query
 from vector_store import initialize_vector_store, get_collection_stats
 from agent import process_query, classify_intent
+from auth import initialize_auth, login as auth_login
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,7 +34,11 @@ async def lifespan(app: FastAPI):
     initialize_database()
     logger.info("[Startup] SQLite ready.")
 
-    # 2. Initialize ChromaDB — FIX #1: re-enabled with graceful fallback
+    # 2. Initialize Auth (creates users table + default accounts)
+    initialize_auth()
+    logger.info("[Startup] Auth ready.")
+
+    # 3. Initialize ChromaDB with graceful fallback
     handbook_path = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "handbook.md")
     )
@@ -49,7 +54,7 @@ async def lifespan(app: FastAPI):
             "Policy queries will use inline fallback — bot still works."
         )
 
-    # 3. Warn if no API keys
+    # 4. Warn if no API keys
     groq_key   = os.getenv("GROQ_API_KEY",   "").strip()
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not groq_key and not gemini_key:
@@ -59,9 +64,7 @@ async def lifespan(app: FastAPI):
         logger.info(f"[Startup] LLM providers: {', '.join(providers)}")
 
     logger.info("[Startup] IM|Copilot is ready.")
-
     yield
-
     logger.info("[Shutdown] Goodbye.")
 
 
@@ -72,15 +75,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# FIX #2: CORS — allow all origins to fix "cannot connect to server" errors
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # fixes localhost vs 127.0.0.1 mismatch
-    allow_credentials=False,   # must be False when allow_origins=["*"]
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# ── Pydantic Models ────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     query:      str = Field(..., min_length=1, max_length=1000)
@@ -115,6 +119,36 @@ class DashboardResponse(BaseModel):
     status_summary:   dict
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    success:    bool
+    username:   str = ""
+    role:       str = ""
+    student_id: str = ""
+    message:    str = ""
+
+
+# ── Auth ───────────────────────────────────────────────────────
+
+@app.post("/login", response_model=LoginResponse, tags=["Auth"])
+async def login_endpoint(req: LoginRequest):
+    user = auth_login(req.username, req.password)
+    if user:
+        return LoginResponse(
+            success=True,
+            username=user["username"],
+            role=user["role"],
+            student_id=user["student_id"] or "",
+        )
+    return LoginResponse(success=False, message="Invalid username or password.")
+
+
+# ── Health ─────────────────────────────────────────────────────
+
 @app.get("/", tags=["Health"])
 async def health_check():
     groq_key   = os.getenv("GROQ_API_KEY",   "").strip()
@@ -130,13 +164,15 @@ async def health_check():
     }
 
 
+# ── Dashboard ──────────────────────────────────────────────────
+
 @app.get("/dashboard/{student_id}", response_model=DashboardResponse, tags=["Dashboard"])
 async def get_dashboard(student_id: str):
     data = get_student_dashboard(student_id.upper())
     if not data:
         raise HTTPException(
             status_code=404,
-            detail=f"Student '{student_id}' not found. Available IDs: S001–S010.",
+            detail=f"Student '{student_id}' not found. Available IDs: S001-S010.",
         )
 
     cgpa    = data["student"].get("cgpa", 0.0)
@@ -167,6 +203,8 @@ async def get_dashboard(student_id: str):
         status_summary=status_summary,
     )
 
+
+# ── Chat ───────────────────────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(request: ChatRequest):
@@ -200,6 +238,8 @@ async def chat(request: ChatRequest):
     )
 
 
+# ── Students (Dev/Demo) ────────────────────────────────────────
+
 @app.get("/students", tags=["Dev / Demo"])
 async def list_students(program: Optional[str] = Query(None)):
     sql = (
@@ -228,6 +268,8 @@ async def get_student(student_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Vector Store ───────────────────────────────────────────────
+
 @app.get("/vector-store/stats", tags=["Vector Store"])
 async def vector_store_stats():
     try:
@@ -244,15 +286,22 @@ async def reingest_handbook():
         from chromadb.config import Settings
         import vector_store as vs
 
-        client = chromadb.PersistentClient(path=CHROMA_PATH, settings=Settings(anonymized_telemetry=False))
+        client = chromadb.PersistentClient(
+            path=CHROMA_PATH,
+            settings=Settings(anonymized_telemetry=False)
+        )
         try:
             client.delete_collection(COLLECTION_NAME)
         except Exception:
             pass
         vs._collection = None
 
-        handbook_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "handbook.md"))
-        stats = initialize_vector_store(handbook_path if os.path.exists(handbook_path) else None)
+        handbook_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "handbook.md")
+        )
+        stats = initialize_vector_store(
+            handbook_path if os.path.exists(handbook_path) else None
+        )
         return {"status": "success", "stats": stats}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
