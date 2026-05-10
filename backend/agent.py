@@ -1,418 +1,519 @@
 """
-agent.py — The brain of IM|Copilot.
+agent.py — Hybrid AI Agent for IM|Copilot
+Intelligently routes between SQL Agent (personal data) and RAG Agent (policies).
 """
 
 import os
 import re
-import json
-import logging
-from enum import Enum
-from typing import Optional
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
-from database import get_schema, execute_read_query
-from vector_store import retrieve_context, build_rag_context_string
+from database import DB_SCHEMA as DATABASE_SCHEMA, execute_read_query as execute_safe_sql
+from vector_store import retrieve_context as retrieve_relevant_chunks, build_rag_context_string as build_rag_context, HANDBOOK_INLINE_TEXT
 
-logger = logging.getLogger(__name__)
-
+# ── API Keys ───────────────────────────────────
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY",   "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+LLM_PROVIDER   = os.getenv("LLM_PROVIDER",  "groq").strip().lower()
 
-_groq_client  = None
-_gemini_model = None
-
-
-def _get_groq_client():
-    global _groq_client
-    if _groq_client is None and GROQ_API_KEY:
-        try:
-            from groq import Groq
-            import httpx
-            # FIX #3: pass explicit httpx client to avoid proxy detection crash
-            _groq_client = Groq(
-                api_key=GROQ_API_KEY,
-                http_client=httpx.Client(timeout=30.0, follow_redirects=True)
-            )
-            logger.info("[LLM] Groq client initialized.")
-        except Exception as e:
-            logger.error(f"[LLM] Groq init failed: {e}")
-    return _groq_client
+print(f"[Agent] Provider : {LLM_PROVIDER}")
+print(f"[Agent] Groq key : {'SET ✓' if GROQ_API_KEY else 'MISSING ✗'}")
+print(f"[Agent] Gemini key: {'SET ✓' if GEMINI_API_KEY else 'MISSING ✗'}")
 
 
-def _get_gemini_model():
-    global _gemini_model
-    if _gemini_model is None and GEMINI_API_KEY:
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=GEMINI_API_KEY)
-            _gemini_model = genai.GenerativeModel("gemini-2.0-flash")
-            logger.info("[LLM] Gemini model initialized.")
-        except Exception as e:
-            logger.error(f"[LLM] Gemini init failed: {e}")
-    return _gemini_model
+# ─────────────────────────────────────────────────
+# LLM CALL (Groq or Gemini)
+# ─────────────────────────────────────────────────
+def call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.1, history: list[dict] = None) -> str:
+    """Call the configured LLM provider and return the text response."""
+    history = history or []
 
+    if LLM_PROVIDER == "groq" and GROQ_API_KEY:
+        from groq import Groq
+        client = Groq(api_key=GROQ_API_KEY)
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in history:
+            messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+        messages.append({"role": "user", "content": user_prompt})
 
-def _call_llm(system_prompt: str, user_message: str,
-              temperature: float = 0.1, max_tokens: int = 1024) -> str:
-    if not GROQ_API_KEY and not GEMINI_API_KEY:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=temperature,
+            max_tokens=1024,
+        )
+        return response.choices[0].message.content.strip()
+
+    elif GEMINI_API_KEY:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            system_instruction=system_prompt
+        )
+        gemini_history = []
+        for msg in history:
+            role = "user" if msg.get("role") == "user" else "model"
+            gemini_history.append({"role": role, "parts": [msg.get("content", "")]})
+            
+        chat = model.start_chat(history=gemini_history)
+        response = chat.send_message(user_prompt)
+        return response.text.strip()
+
+    else:
         raise RuntimeError(
-            "No API keys configured. Add GROQ_API_KEY or GEMINI_API_KEY to backend/.env"
+            "No LLM provider available. "
+            "Add GROQ_API_KEY or GEMINI_API_KEY to backend/.env"
         )
 
-    # Try Groq first
-    if GROQ_API_KEY:
-        groq = _get_groq_client()
-        if groq:
-            try:
-                response = groq.chat.completions.create(
-                    model="llama-3.1-8b-instant",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user",   "content": user_message},
-                    ],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                return response.choices[0].message.content.strip()
-            except Exception as e:
-                logger.warning(f"[LLM] Groq failed ({type(e).__name__}: {e}), trying Gemini.")
 
-    # Fallback to Gemini
-    if GEMINI_API_KEY:
-        gemini = _get_gemini_model()
-        if gemini:
-            try:
-                response = gemini.generate_content(f"{system_prompt}\n\nUser: {user_message}")
-                return response.text.strip()
-            except Exception as e:
-                raise RuntimeError(f"Both LLM providers failed. Last error: {e}")
+# ─────────────────────────────────────────────────
+# INTENT ROUTER — keyword-first, LLM as fallback
+# ─────────────────────────────────────────────────
 
-    raise RuntimeError("No LLM provider available. Check your API keys in backend/.env")
-
-
-# ── Intent Classification ──────────────────────────────────────
-
-class QueryIntent(str, Enum):
-    ACADEMIC = "academic"
-    POLICY   = "policy"
-    HYBRID   = "hybrid"
-    GREETING = "greeting"
-
-
-_ACADEMIC_KW = [
-    "my gpa", "my cgpa", "my grade", "my attendance", "my marks",
-    "my courses", "my enrollment", "my score", "my result",
-    "how am i doing", "am i passing", "my performance",
-    "my midterm", "my final", "what did i get",
-    "courses i am", "courses i'm", "my transcript",
-    "show me my", "what are my",
+# Strong signals that mean "give me MY data from the database"
+ACADEMIC_KEYWORDS = [
+    # GPA / grades
+    "gpa", "cgpa", "sgpa", "grade", "grades", "marks", "score", "result",
+    "grade point", "semester result", "my result", "my grade",
+    # Attendance
+    "attendance", "absent", "absences", "present", "classes attended",
+    "how many classes", "attendance percentage", "my attendance", "xf",
+    # Courses
+    "my course", "enrolled", "enrollment", "current courses", "subjects",
+    "my subjects", "registered courses", "taking this semester", "improve",
+    # Personal academic
+    "my cgpa", "my gpa", "my marks", "my score", "my performance",
+    "academic standing", "probation status", "my status",
+    "credit hours", "passed courses", "failed courses",
+    # Dashboard-style
+    "dashboard", "academic summary", "semester summary",
+    "show my", "what is my", "tell me my", "display my",
+    "how am i doing", "my academic",
 ]
 
-_POLICY_KW = [
-    "policy", "rule", "regulation", "handbook",
-    "probation", "freeze", "freezing",
-    "attendance requirement", "minimum attendance", "xf grade",
-    "gold medal", "distinction", "scholarship", "fee refund",
-    "make-up", "makeup exam", "retotal", "unfair means",
-    "credit hours requirement", "grading system",
-    "what is the", "how many credit", "can a student",
-    "eligibility", "admission criteria", "library rule",
-    "hostel rule", "transfer of credit", "semester load",
-    "degree duration", "drop policy", "dropout",
-]
-
-_GREETING_KW = [
-    "hello", "hi ", "hey ", "good morning", "good afternoon",
-    "good evening", "thanks", "thank you", "bye", "goodbye",
-]
-
-_HYBRID_PATTERNS = [
-    r"am i (on probation|at risk|going to fail|eligible for medal)",
-    r"will i (be dropped|get xf|fail|qualify for)",
-    r"do i (qualify|meet the requirement|have enough attendance)",
-    r"should i (freeze|drop|repeat|be worried)",
-    r"am i (safe|in danger|at risk)",
+# Strong signals that mean "explain a policy / rule"
+POLICY_KEYWORDS = [
+    "policy", "rule", "regulation", "handbook", "procedure",
+    "what is the", "how does", "explain", "define", "what are the requirements",
+    "eligibility", "criteria", "allowed", "permitted", "prohibited",
+    "penalty", "fine", "scholarship", "hostel", "library", "transport",
+    "freeze semester", "drop course", "withdraw", "make-up exam",
+    "gold medal", "distinction", "degree requirement",
+    "minimum attendance", "probation policy", "grading system",
+    "how many credit", "duration of", "academic year", "xf",
 ]
 
 
-def classify_intent(query: str) -> QueryIntent:
-    q = query.lower().strip()
-    if any(kw in q for kw in _GREETING_KW) and len(q) < 60:
-        return QueryIntent.GREETING
-    academic_hit = any(kw in q for kw in _ACADEMIC_KW)
-    policy_hit   = any(kw in q for kw in _POLICY_KW)
-    if any(re.search(p, q) for p in _HYBRID_PATTERNS):
-        return QueryIntent.HYBRID
-    if academic_hit and not policy_hit:
-        return QueryIntent.ACADEMIC
-    if policy_hit and not academic_hit:
-        return QueryIntent.POLICY
-    if academic_hit and policy_hit:
-        return _llm_classify(query)
-    return QueryIntent.POLICY
+def classify_intent(query: str, student_id: str = None) -> str:
+    """
+    Classify query intent using keyword matching first (fast + reliable).
+    Falls back to LLM classification only when truly ambiguous.
 
+    Returns: 'academic_query' | 'policy_query' | 'hybrid_query'
+    """
+    q_lower = query.lower().strip()
 
-def _llm_classify(query: str) -> QueryIntent:
-    prompt = (
-        "Classify this university student query into ONE category:\n"
-        "ACADEMIC = personal data (GPA, grades, attendance, enrolled courses)\n"
-        "POLICY   = university rules, regulations, policies, fees, procedures\n"
-        "HYBRID   = needs both personal data AND policy knowledge\n\n"
-        "Respond with ONLY one word: ACADEMIC, POLICY, or HYBRID."
-    )
+    # ── Personal pronouns + academic terms → always SQL ──
+    has_my = any(w in q_lower for w in ["my ", "i ", "me ", "am i", "do i", "i have", "i am"])
+    has_academic = any(k in q_lower for k in ACADEMIC_KEYWORDS)
+    has_policy   = any(k in q_lower for k in POLICY_KEYWORDS)
+
+    # Has both → hybrid
+    if has_academic and has_policy:
+        return "hybrid_query"
+
+    # Personal data question → SQL
+    if has_my and has_academic:
+        return "academic_query"
+
+    # Pure personal data (no "my" needed for obvious queries)
+    if any(k in q_lower for k in [
+        "gpa", "cgpa", "sgpa", "attendance percentage",
+        "my grade", "my marks", "my score", "my result",
+        "show my", "display my", "what is my", "tell me my"
+    ]):
+        return "academic_query"
+
+    # Pure policy question
+    if has_policy and not has_academic:
+        return "policy_query"
+
+    # Ambiguous — ask LLM (fast classification call)
     try:
-        result = _call_llm(prompt, query, temperature=0.0, max_tokens=10).upper()
-        if "ACADEMIC" in result: return QueryIntent.ACADEMIC
-        if "HYBRID"   in result: return QueryIntent.HYBRID
-        return QueryIntent.POLICY
+        classification = call_llm(
+            system_prompt=(
+                "You are a query classifier for a university academic assistant.\n"
+                "Classify the user query into EXACTLY one of these categories:\n\n"
+                "- academic_query: asking about personal student data (GPA, grades, attendance, enrolled courses, results)\n"
+                "- policy_query: asking about university rules, policies, regulations, procedures, requirements\n"
+                "- hybrid_query: asking about both personal data AND policies\n\n"
+                "Reply with ONLY the category name, nothing else."
+            ),
+            user_prompt=f"Query: {query}",
+            temperature=0.0
+        )
+        intent = classification.strip().lower()
+        if intent in ("academic_query", "policy_query", "hybrid_query"):
+            return intent
+        # If LLM gives unexpected output, default to academic if student_id is present
+        return "academic_query" if student_id else "policy_query"
+
     except Exception:
-        return QueryIntent.POLICY
+        # Safe fallback
+        return "academic_query" if student_id and has_academic else "policy_query"
 
 
-# ── SQL Agent ──────────────────────────────────────────────────
+# ─────────────────────────────────────────────────
+# SQL AGENT
+# ─────────────────────────────────────────────────
+def run_sql_agent(query: str, student_id: str = None, is_admin: bool = False, format_response: bool = True, history: list = None) -> dict:
+    """
+    Generates SQL from the user's natural language query,
+    executes it safely, and returns a natural language answer.
+    """
+    history = history or []
 
-def _build_sql_system_prompt(student_id: str) -> str:
-    schema = get_schema()
-    return f"""You are an expert SQLite query generator for a university student information system.
-Your ONLY job is to produce a single valid SELECT statement.
+    if is_admin:
+        user_context = "CURRENT USER: ADMINISTRATOR (Full access to all students. Use aggregations like COUNT, AVG, SUM, GROUP BY.)"
+        rule_3 = "3. You may query across all students and programs without restriction."
+    else:
+        user_context = f"CURRENT USER:\n- Student ID: {student_id}\n- You MUST always filter queries using: WHERE student_id = '{student_id}'"
+        rule_3 = f"3. Always include student_id = '{student_id}' in the WHERE clause."
 
-{schema}
+    # ── Step 1: Generate SQL ──────────────────────
+    sql_system_prompt = f"""You are an expert SQL generator for a university academic database.
 
-HARD RULES — never violate:
-1. Only SELECT statements. Never INSERT, UPDATE, DELETE, DROP, ALTER, CREATE.
-2. Always filter: WHERE student_id = '{student_id}' (for student-specific data).
-3. Use JOINs when course names are needed (join with courses table).
-4. Add LIMIT 20 to all queries.
-5. Return ONLY raw SQL — no markdown, no backticks, no explanation.
-6. If the question cannot be answered from the schema, return exactly:
-   SELECT 'DATA_NOT_AVAILABLE' AS message;
+{DATABASE_SCHEMA}
 
-QUICK EXAMPLES:
-Q: "What is my CGPA?"
-A: SELECT name, program, semester, cgpa FROM students WHERE student_id = '{student_id}';
+{user_context}
 
-Q: "Show my grades"
-A: SELECT g.course_id, c.course_name, g.midterm_marks, g.final_marks, g.assignment_marks, g.total_marks, g.letter_grade, g.grade_points FROM grades g JOIN courses c ON g.course_id = c.course_id WHERE g.student_id = '{student_id}' ORDER BY g.semester_label DESC LIMIT 20;
+YOUR TASK:
+1. Read the user's question carefully.
+2. Generate a single, valid SQLite SELECT query that answers it.
+{rule_3}
+4. Return ONLY the raw SQL query — no explanation, no markdown, no backticks.
+5. Do NOT generate INSERT, UPDATE, DELETE, DROP, or any mutating SQL.
 
-Q: "Which courses have attendance issues?"
-A: SELECT a.course_id, c.course_name, a.attended_classes, a.total_classes, a.attendance_pct, a.status FROM attendance a JOIN courses c ON a.course_id = c.course_id WHERE a.student_id = '{student_id}' ORDER BY a.attendance_pct ASC LIMIT 20;"""
+COMMON QUERY PATTERNS:
+{"- Admin queries: SELECT COUNT(*) FROM students WHERE cgpa < 2.0" if is_admin else "- For GPA/CGPA: SELECT cgpa FROM students WHERE student_id = '{student_id}'"}
+"""
 
-
-_SQL_FORMAT_PROMPT = """You are IM|Copilot, a helpful academic assistant for IMSciences students.
-
-Student asked: "{query}"
-
-Database result:
-{data}
-
-Write a clear, friendly response:
-- Summarize key numbers (round to 2 decimal places).
-- If CGPA < 2.2, mention probation risk.
-- If CGPA < 2.0, mention immediate drop risk.
-- If any attendance < 80%, warn about XF grade risk.
-- Use bullet points for multiple items.
-- End with one practical tip if the data suggests a concern.
-- Do NOT invent numbers not in the data."""
-
-
-def run_sql_agent(query: str, student_id: str) -> dict:
-    system_prompt = _build_sql_system_prompt(student_id)
-    try:
-        raw_sql = _call_llm(system_prompt, query, temperature=0.0, max_tokens=300)
-    except Exception as e:
-        return {"intent": "academic", "answer": f"❌ AI service unavailable: {e}\n\nCheck that GROQ_API_KEY or GEMINI_API_KEY is set in backend/.env", "sql": None, "data": None, "error": str(e)}
-
-    sql = _extract_sql(raw_sql)
-    logger.info(f"[SQL Agent] Generated: {sql}")
+    sql_user_prompt = f"Generate SQL to answer the latest question: {query}"
 
     try:
-        rows = execute_read_query(sql)
+        raw_sql = call_llm(sql_system_prompt, sql_user_prompt, temperature=0.0, history=history)
+    except RuntimeError as e:
+        return {
+            "response": f"❌ AI service unavailable: {str(e)}\n\nCheck that GROQ_API_KEY or GEMINI_API_KEY is set in backend/.env",
+            "intent":   "error",
+            "sources":  [],
+            "sql_used": None,
+            "raw_rows": []
+        }
+
+    # ── Clean the generated SQL ───────────────────
+    sql = raw_sql.strip()
+    sql = re.sub(r"```(?:sql)?", "", sql, flags=re.IGNORECASE)
+    sql = sql.replace("```", "").strip()
+
+    # ── Step 2: Execute SQL safely ────────────────
+    try:
+        rows = execute_safe_sql(sql)
     except ValueError as e:
-        return {"intent": "academic", "answer": "Security restriction: that query type is not permitted.", "sql": sql, "data": None, "error": str(e)}
-    except Exception as e:
-        logger.error(f"[SQL Agent] DB error: {e}")
-        return {"intent": "academic", "answer": "I had trouble retrieving your data. Please try again.", "sql": sql, "data": None, "error": str(e)}
+        # SQL execution failed — try a safe fallback query
+        fallback_sql = f"SELECT * FROM students WHERE student_id = '{student_id}'"
+        try:
+            rows = execute_safe_sql(fallback_sql)
+            sql  = fallback_sql
+        except Exception:
+            return {
+                "response": f"I had trouble retrieving your data. The query encountered an error: {str(e)}",
+                "intent":   "academic_query",
+                "sources":  [],
+                "sql_used": sql,
+                "rows_returned": 0,
+                "raw_rows": []
+            }
+
+    if not format_response:
+        return {
+            "response": "",
+            "intent":   "academic_query",
+            "sources":  ["Student Academic Database"],
+            "sql_used": sql,
+            "rows_returned": len(rows),
+            "raw_rows": rows
+        }
+
+    # ── Step 3: Format results into natural language ──
+    format_system_prompt = """You are a friendly, helpful academic advisor assistant at IMSciences.
+You are given structured database results and must convert them into a clear, natural response.
+
+RULES:
+- Be direct and specific — mention exact numbers (GPA values, percentages, grades)
+- Use a warm, supportive tone
+- If attendance is below 75% in any course, gently flag it as a concern
+- If CGPA is below 2.0, mention that the student may be at risk of probation
+- Format numbers clearly (e.g., "3.45 out of 4.0", "85%")
+- Do NOT say you cannot access data — you have the data in front of you
+- Keep the response concise but complete
+- Use bullet points or short paragraphs for multiple items
+"""
+
+    format_user_prompt = f"""Student's latest question: "{query}"
+
+Database results:
+{rows}
+"""
 
     if not rows:
-        return {"intent": "academic", "answer": "No records found for your query. This semester's data may not be available yet.", "sql": sql, "data": [], "error": None}
-
-    data_str   = json.dumps(rows, indent=2)
-    fmt_prompt = _SQL_FORMAT_PROMPT.format(query=query, data=data_str)
-    try:
-        answer = _call_llm("You are IM|Copilot, a friendly academic assistant for IMSciences.", fmt_prompt, temperature=0.3, max_tokens=600)
-    except Exception:
-        answer = f"Here is your requested data:\n\n{data_str}"
-
-    return {"intent": "academic", "answer": answer, "sql": sql, "data": rows, "error": None}
-
-
-def _extract_sql(raw: str) -> str:
-    raw = re.sub(r"```sql", "", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"```",    "", raw)
-    match = re.search(r"(SELECT\b.+?)(?:;|$)", raw, re.IGNORECASE | re.DOTALL)
-    if match:
-        sql = match.group(1).strip()
-        return sql if sql.endswith(";") else sql + ";"
-    return raw.strip()
-
-
-# ── RAG Agent ──────────────────────────────────────────────────
-
-_RAG_SYSTEM_PROMPT = """You are IM|Copilot, the official AI assistant for the Institute of Management Sciences (IMSciences), Peshawar.
-
-RETRIEVED POLICY CONTEXT (from the official IMSciences Student Handbook):
-{context}
-
-YOUR RULES:
-1. Answer ONLY from the context above. Do not use outside knowledge for policy details.
-2. If the context is insufficient, say: "I don't have specific information on that. Please contact the relevant office or consult the official Student Handbook."
-3. Never speculate or invent rules, percentages, or deadlines.
-4. Cite the chapter/section when answering (e.g., "According to Chapter 1, Rule 9...").
-5. Be clear, concise, and student-friendly. Use bullet points for multi-part answers.
-6. If a rule has conditions or exceptions, state them explicitly."""
-
-
-_RAG_HYBRID_PROMPT = """You are IM|Copilot, the official AI assistant for IMSciences.
-
-The student's question requires comparing their personal data with a university policy.
-
-POLICY CONTEXT (from the IMSciences Student Handbook):
-{context}
-
-STUDENT'S CURRENT ACADEMIC DATA:
-{student_data}
-
-Student's question: {query}
-
-Instructions:
-1. Interpret the student's data (e.g., "Your current CGPA is 1.9...").
-2. Apply the relevant policy rule from the context.
-3. Give a direct, personalized verdict (e.g., "Based on Rule 18, you are currently on probation...").
-4. If the situation is concerning, be empathetic and suggest concrete next steps.
-5. Cite the exact rule you are applying.
-6. Do NOT invent data or policy details not present above."""
-
-
-def run_rag_agent(query: str, student_id: Optional[str] = None,
-                  student_data: Optional[list] = None) -> dict:
-    try:
-        chunks      = retrieve_context(query, top_k=4)
-        context_str = build_rag_context_string(chunks)
-    except Exception as e:
-        logger.warning(f"[RAG] ChromaDB unavailable ({e}), using inline fallback.")
-        from vector_store import HANDBOOK_INLINE_TEXT
-        context_str = HANDBOOK_INLINE_TEXT
-        chunks = []
-
-    if student_data:
-        system_prompt = _RAG_HYBRID_PROMPT.format(
-            context=context_str,
-            student_data=json.dumps(student_data, indent=2),
-            query=query,
-        )
-        user_message = query
+        format_user_prompt += "\nNote: The query returned empty results ([]). This means the student has no records matching their criteria (e.g., no bad grades, no courses with low attendance). DO NOT say 'your database is empty' or 'you have a clean slate'. Reassure them naturally (e.g., 'I checked your profile and you don't have any courses flagged')."
     else:
-        system_prompt = _RAG_SYSTEM_PROMPT.format(context=context_str)
-        user_message  = query
+        format_user_prompt += "\nWrite a helpful, natural language response using these exact results."
 
     try:
-        answer = _call_llm(system_prompt, user_message, temperature=0.2, max_tokens=800)
-    except Exception as e:
-        return {"intent": "policy", "answer": f"❌ AI service unavailable: {e}\n\nCheck that GROQ_API_KEY or GEMINI_API_KEY is set in backend/.env", "chunks": chunks, "context": context_str, "error": str(e)}
+        response_text = call_llm(format_system_prompt, format_user_prompt, temperature=0.3, history=history)
+    except Exception:
+        # Fallback: just format the raw data
+        response_text = format_rows_as_text(query, rows)
 
     return {
-        "intent":  "policy" if not student_data else "hybrid",
-        "answer":  answer,
-        "chunks":  [{"rank": c["rank"], "source": c["source"], "distance": c["distance"]} for c in chunks],
-        "context": context_str,
-        "error":   None,
+        "response": response_text,
+        "intent":   "academic_query",
+        "sources":  ["Student Academic Database"],
+        "sql_used": sql,
+        "rows_returned": len(rows),
+        "raw_rows": rows
     }
 
 
-# ── Hybrid Agent ───────────────────────────────────────────────
+def format_rows_as_text(query: str, rows: list[dict]) -> str:
+    """Simple fallback formatter if LLM call fails."""
+    if not rows:
+        return "No data found."
+    if len(rows) == 1:
+        row = rows[0]
+        lines = [f"**{k.replace('_', ' ').title()}**: {v}" for k, v in row.items() if v is not None]
+        return "\n".join(lines)
+    lines = []
+    for i, row in enumerate(rows, 1):
+        parts = ", ".join(f"{k}: {v}" for k, v in row.items() if v is not None)
+        lines.append(f"{i}. {parts}")
+    return "\n".join(lines)
 
-def run_hybrid_agent(query: str, student_id: str) -> dict:
-    q = query.lower()
-    if any(w in q for w in ["probation", "cgpa", "gpa", "dropped"]):
-        sub_query = "What is my current CGPA and program?"
-    elif any(w in q for w in ["attendance", "xf", "absent"]):
-        sub_query = "Show me my attendance percentage in all courses this semester"
-    elif any(w in q for w in ["grade", "fail", "medal", "distinction"]):
-        sub_query = "Show me all my grades and letter grades this semester"
-    else:
-        sub_query = "Show me my CGPA, program, semester, and current grades"
 
-    sql_result   = run_sql_agent(sub_query, student_id)
-    student_data = sql_result.get("data", [])
-    rag_result   = run_rag_agent(query, student_id=student_id, student_data=student_data)
+# ─────────────────────────────────────────────────
+# RAG AGENT
+# ─────────────────────────────────────────────────
+def run_rag_agent(query: str, history: list = None) -> dict:
+    """
+    Retrieves relevant policy chunks from ChromaDB and
+    generates a grounded, cited answer.
+    """
+    history = history or []
+
+    # ── Retrieve chunks ───────────────────────────
+    chunks = retrieve_relevant_chunks(query, top_k=4)
+    context = build_rag_context(chunks)
+    sources = list({c["source"] for c in chunks})
+
+    if not context:
+        context = f"FALLBACK HANDBOOK CONTEXT:\n{HANDBOOK_INLINE_TEXT}"
+        sources = ["Inline Handbook Fallback"]
+
+    # ── Generate answer ───────────────────────────
+    rag_system_prompt = """You are an expert academic policy advisor for the Institute of Management Sciences (IMSciences), Peshawar.
+
+You answer students' questions about university rules, policies, and regulations using ONLY the provided handbook excerpts.
+
+RULES:
+- Base your answer ONLY on the provided context below
+- Be specific — quote relevant numbers, percentages, and thresholds
+- If the context doesn't contain enough information, say so clearly and suggest contacting the relevant office
+- Do NOT make up policies or rules
+- Keep the tone helpful, professional, and student-friendly
+- Structure longer answers with clear points
+"""
+
+    rag_user_prompt = f"""Student's latest question: {query}
+
+Relevant Handbook Excerpts:
+{context}
+
+Provide a clear, accurate answer based strictly on the above excerpts."""
+
+    try:
+        response_text = call_llm(rag_system_prompt, rag_user_prompt, temperature=0.2, history=history)
+    except RuntimeError as e:
+        return {
+            "response": f"❌ AI service unavailable: {str(e)}\n\nCheck that GROQ_API_KEY or GEMINI_API_KEY is set in backend/.env",
+            "intent":   "error",
+            "sources":  [],
+            "chunks_retrieved": 0
+        }
 
     return {
-        "intent": "hybrid",
-        "answer": rag_result["answer"],
-        "sql":    sql_result.get("sql"),
-        "data":   student_data,
-        "chunks": rag_result.get("chunks", []),
-        "error":  rag_result.get("error"),
+        "response": response_text,
+        "intent":   "policy_query",
+        "sources":  sources,
+        "sql_used": None,
+        "chunks_retrieved": len(chunks)
     }
 
 
-# ── Greeting Handler ───────────────────────────────────────────
+# ─────────────────────────────────────────────────
+# HYBRID AGENT (both personal data + policy)
+# ─────────────────────────────────────────────────
+def run_hybrid_agent(query: str, student_id: str = None, is_admin: bool = False, history: list = None) -> dict:
+    """Runs both SQL and RAG pipelines and combines their outputs holistically via a single LLM prompt."""
+    history = history or []
+    if not is_admin and not student_id:
+        return run_rag_agent(query, history=history)
 
-_GREETING_PROMPT = """You are IM|Copilot, a friendly AI academic assistant for IMSciences Peshawar.
-Greet the student warmly in 2-3 sentences. Mention you can help with:
-university policies, GPA/grades, attendance, scholarships, and academic rules.
-Be professional and welcoming."""
+    # 1. Fetch SQL data (skip natural language formatting step)
+    sql_result = run_sql_agent(query, student_id=student_id, is_admin=is_admin, format_response=False, history=history)
+    raw_rows = sql_result.get("raw_rows", [])
+    sql_used = sql_result.get("sql_used")
 
+    # 2. Fetch Policy chunks
+    chunks = retrieve_relevant_chunks(query, top_k=4)
+    context = build_rag_context(chunks)
+    sources = list({c["source"] for c in chunks})
 
-def run_greeting_handler(query: str) -> dict:
+    if not context:
+        context = f"FALLBACK HANDBOOK CONTEXT:\n{HANDBOOK_INLINE_TEXT}"
+        if "Inline Handbook Fallback" not in sources:
+            sources.append("Inline Handbook Fallback")
+
+    # 3. Generate Holistic Response
+    hybrid_system_prompt = """You are an expert academic advisor for IMSciences Peshawar.
+You are given a student's personal database records AND official university policy excerpts.
+Your task is to provide a single, unified, conversational response that answers the student's question by applying the policy rules to their specific data.
+
+RULES:
+- Interpret the student's database records using the policy context.
+- Quote specific numbers from their data (e.g., "Your attendance in CS101 is 78%").
+- Cite the relevant policy rule clearly.
+- Be warm, direct, and helpful. 
+- NEVER use disjointed headers like "Your Academic Data:" or "Relevant Policy:". Write a natural, cohesive response.
+- If the database records are empty ([]), it means no negative records matched their query. DO NOT use robotic phrases like "your database records are empty" or "clean slate". Instead, naturally reassure them (e.g., "I checked your profile and you currently don't have any courses falling below the threshold"), then explain the policy."""
+
+    hybrid_user_prompt = f"""Student's latest question: "{query}"
+
+Database Records (JSON):
+{raw_rows}
+
+Policy Handbook Excerpts:
+{context}
+
+Provide a personalized, holistic analysis:"""
+
     try:
-        answer = _call_llm(_GREETING_PROMPT, query, temperature=0.5, max_tokens=120)
-    except Exception:
-        answer = (
-            "Hello! I'm IM|Copilot, your AI academic assistant for IMSciences. "
-            "Ask me about your GPA, attendance, university policies, "
-            "scholarships, or any academic rules. I'm here to help!"
-        )
-    return {"intent": "greeting", "answer": answer, "error": None}
+        response_text = call_llm(hybrid_system_prompt, hybrid_user_prompt, temperature=0.2, history=history)
+    except Exception as e:
+        response_text = f"❌ AI service unavailable: {str(e)}"
+
+    db_source = ["Student Academic Database"] if sql_used else []
+
+    return {
+        "response": response_text,
+        "intent":   "hybrid_query",
+        "sources":  sources + db_source,
+        "sql_used": sql_used,
+        "rows_returned": len(raw_rows),
+        "chunks_retrieved": len(chunks)
+    }
 
 
-# ── Main Router ────────────────────────────────────────────────
+# ─────────────────────────────────────────────────
+# MAIN ROUTER
+# ─────────────────────────────────────────────────
+def run_chat_agent(query: str, student_id: str = None, user_role: str = "student", history: list = None) -> dict:
+    """
+    Main entry point. Routes query to the correct agent.
 
-def process_query(query: str, student_id: str) -> dict:
-    if not query or not query.strip():
-        return {"intent": "error", "answer": "Please enter a valid question.", "error": "Empty query"}
+    Args:
+        query:      The user's natural language question
+        student_id: The authenticated student's ID (from JWT token)
+        user_role:  'student' or 'admin'
 
-    intent = classify_intent(query)
-    logger.info(f"[Router] '{query[:55]}' → {intent.value.upper()}")
+    Returns:
+        dict with keys: response, intent, sources, sql_used
+    """
+    if not query.strip():
+        return {
+            "response": "Please ask me a question!",
+            "intent":   "error",
+            "sources":  [],
+            "sql_used": None
+        }
 
-    if   intent == QueryIntent.GREETING: return run_greeting_handler(query)
-    elif intent == QueryIntent.ACADEMIC: return run_sql_agent(query, student_id)
-    elif intent == QueryIntent.POLICY:   return run_rag_agent(query)
-    elif intent == QueryIntent.HYBRID:   return run_hybrid_agent(query, student_id)
-    else:                                return run_rag_agent(query)
+    print(f"\n[Agent] Query     : {query}")
+    print(f"[Agent] Student ID: {student_id}")
+    print(f"[Agent] Role      : {user_role}")
+
+    # ── Classify intent ───────────────────────────
+    intent = classify_intent(query, student_id)
+    print(f"[Agent] Intent    : {intent}")
+
+    # ── Route to correct agent ────────────────────
+    try:
+        is_admin = (user_role == "admin")
+
+        if intent == "academic_query":
+            if not is_admin and not student_id:
+                return {
+                    "response": "I need your student ID to look up academic data. Please make sure you're logged in.",
+                    "intent":   "academic_query",
+                    "sources":  [],
+                    "sql_used": None
+                }
+            return run_sql_agent(query, student_id=student_id, is_admin=is_admin, history=history)
+
+        elif intent == "policy_query":
+            return run_rag_agent(query, history=history)
+
+        elif intent == "hybrid_query":
+            return run_hybrid_agent(query, student_id=student_id, is_admin=is_admin, history=history)
+
+        else:
+            return run_rag_agent(query, history=history)
+
+    except Exception as e:
+        print(f"[Agent] ERROR: {e}")
+        return {
+            "response": f"I encountered an unexpected error: {str(e)}. Please try again.",
+            "intent":   "error",
+            "sources":  [],
+            "sql_used": None
+        }
 
 
+# ─────────────────────────────────────────────────
+# STANDALONE TEST
+# ─────────────────────────────────────────────────
 if __name__ == "__main__":
-    tests = [
-        ("What is the minimum attendance requirement?", "POLICY"),
-        ("What is my current CGPA?",                   "ACADEMIC"),
-        ("Show me my grades this semester",             "ACADEMIC"),
-        ("Am I on probation?",                          "HYBRID"),
-        ("What happens if I get XF?",                   "POLICY"),
-        ("Hello!",                                      "GREETING"),
-        ("Can I freeze my semester?",                   "POLICY"),
-        ("Do I qualify for gold medal?",                "HYBRID"),
+    from database import initialize_database
+    initialize_database()
+
+    test_student = "STU-2021-001"
+    test_cases = [
+        ("What is my CGPA?",                         test_student),
+        ("Show my attendance for this semester",      test_student),
+        ("What are my grades?",                       test_student),
+        ("What is the probation policy?",             None),
+        ("What is the minimum attendance required?",  None),
+        ("Am I at risk of probation based on my GPA?",test_student),
     ]
-    print("=" * 55)
-    print("IM|Copilot — Intent Router Test Suite")
-    print("=" * 55)
-    passed = 0
-    for q, expected in tests:
-        intent = classify_intent(q)
-        got    = intent.value.upper()
-        status = "PASS" if got == expected else "FAIL"
-        if status == "PASS": passed += 1
-        print(f"  [{status}] {q[:45]:<45} → {got}")
-    print(f"\nResult: {passed}/{len(tests)} passed")
+
+    print("\n" + "="*60)
+    for query, sid in test_cases:
+        print(f"\nQ: {query}")
+        print(f"   Student ID: {sid}")
+        result = run_chat_agent(query, student_id=sid)
+        print(f"   Intent : {result['intent']}")
+        print(f"   Answer : {result['response'][:200]}...")
+        print("-"*60)

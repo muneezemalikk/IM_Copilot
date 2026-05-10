@@ -4,16 +4,19 @@ main.py — FastAPI application for IM|Copilot.
 
 import os
 import logging
+import jwt
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, Field
 
 from database import initialize_database, get_student_dashboard, execute_read_query
 from vector_store import initialize_vector_store, get_collection_stats
-from agent import process_query, classify_intent
+from agent import run_chat_agent as process_query, classify_intent
 from auth import initialize_auth, login as auth_login
 
 logging.basicConfig(
@@ -88,13 +91,14 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     query:      str = Field(..., min_length=1, max_length=1000)
-    student_id: str = Field(default="S001")
+    history:    list[dict] = Field(default_factory=list)
+    student_id: str = Field(default="")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "query":      "What is my current CGPA and am I on probation?",
-                "student_id": "S001",
+                "history":    []
             }
         }
 
@@ -130,19 +134,43 @@ class LoginResponse(BaseModel):
     role:       str = ""
     student_id: str = ""
     message:    str = ""
+    token:      str = ""
 
 
 # ── Auth ───────────────────────────────────────────────────────
+
+SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key-12345")
+ALGORITHM = "HS256"
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=1)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def verify_token(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 @app.post("/login", response_model=LoginResponse, tags=["Auth"])
 async def login_endpoint(req: LoginRequest):
     user = auth_login(req.username, req.password)
     if user:
+        token = create_access_token({
+            "sub": user["username"],
+            "role": user["role"],
+            "student_id": user["student_id"] or ""
+        })
         return LoginResponse(
             success=True,
             username=user["username"],
             role=user["role"],
             student_id=user["student_id"] or "",
+            token=token,
         )
     return LoginResponse(success=False, message="Invalid username or password.")
 
@@ -167,7 +195,10 @@ async def health_check():
 # ── Dashboard ──────────────────────────────────────────────────
 
 @app.get("/dashboard/{student_id}", response_model=DashboardResponse, tags=["Dashboard"])
-async def get_dashboard(student_id: str):
+async def get_dashboard(student_id: str, current_user: dict = Depends(verify_token)):
+    if current_user.get("role") != "admin" and current_user.get("student_id") != student_id.upper():
+        raise HTTPException(status_code=403, detail="Not authorized to view this dashboard")
+
     data = get_student_dashboard(student_id.upper())
     if not data:
         raise HTTPException(
@@ -207,33 +238,38 @@ async def get_dashboard(student_id: str):
 # ── Chat ───────────────────────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
-async def chat(request: ChatRequest):
-    logger.info(f"[/chat] student={request.student_id} query='{request.query[:60]}'")
+async def chat(request: ChatRequest, current_user: dict = Depends(verify_token)):
+    student_id = current_user.get("student_id", "").upper()
+    role = current_user.get("role", "student")
+    logger.info(f"[/chat] student={student_id} query='{request.query[:60]}'")
 
     result = process_query(
         query=request.query,
-        student_id=request.student_id.upper(),
+        student_id=student_id,
+        user_role=role,
+        history=request.history,
     )
 
     intent   = result.get("intent", "unknown")
     metadata: dict = {"error": result.get("error")}
 
-    if intent == "academic":
-        metadata["sql_generated"] = result.get("sql")
-        metadata["rows_returned"] = len(result.get("data") or [])
-    elif intent == "policy":
-        metadata["chunks_retrieved"] = len(result.get("chunks") or [])
-        metadata["sources"] = list({c.get("source", "handbook") for c in (result.get("chunks") or [])})
-    elif intent == "hybrid":
-        metadata["sql_generated"]    = result.get("sql")
-        metadata["rows_returned"]    = len(result.get("data") or [])
-        metadata["chunks_retrieved"] = len(result.get("chunks") or [])
+    if intent == "academic_query":
+        metadata["sql_generated"] = result.get("sql_used")
+        metadata["rows_returned"] = result.get("rows_returned", 0)
+    elif intent == "policy_query":
+        metadata["chunks_retrieved"] = result.get("chunks_retrieved", 0)
+        metadata["sources"] = result.get("sources", [])
+    elif intent == "hybrid_query":
+        metadata["sql_generated"]    = result.get("sql_used")
+        metadata["rows_returned"]    = result.get("rows_returned", 0)
+        metadata["chunks_retrieved"] = result.get("chunks_retrieved", 0)
+        metadata["sources"]          = result.get("sources", [])
 
     return ChatResponse(
         query=request.query,
         intent=intent,
-        answer=result.get("answer", "I could not generate a response."),
-        student_id=request.student_id.upper(),
+        answer=result.get("response", "I could not generate a response."),
+        student_id=student_id,
         metadata=metadata,
     )
 
@@ -310,7 +346,7 @@ async def reingest_handbook():
 @app.get("/intent-test", tags=["Dev / Demo"])
 async def test_intent(q: str = Query(...)):
     intent = classify_intent(q)
-    return {"query": q, "intent": intent.value}
+    return {"query": q, "intent": intent}
 
 
 if __name__ == "__main__":

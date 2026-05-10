@@ -31,10 +31,11 @@ const attColor = (pct) => {
 };
 
 const intentBadge = {
-  academic: { label: "Academic Data",   color: "#6366f1", icon: Database },
-  policy:   { label: "Policy Query",    color: "#0ea5e9", icon: BookOpen  },
-  hybrid:   { label: "Hybrid Analysis", color: "#a855f7", icon: Zap       },
-  greeting: { label: "Greeting",        color: "#22c55e", icon: Bot       },
+  academic_query: { label: "Academic Data",   color: "#6366f1", icon: Database },
+  policy_query:   { label: "Policy Query",    color: "#0ea5e9", icon: BookOpen  },
+  hybrid_query:   { label: "Hybrid Analysis", color: "#a855f7", icon: Zap       },
+  greeting:       { label: "Greeting",        color: "#22c55e", icon: Bot       },
+  error:          { label: "Error",           color: "#ef4444", icon: AlertTriangle },
 };
 
 // ─── Google Fonts ──────────────────────────────────────────
@@ -68,7 +69,7 @@ const FontLoader = () => (
       background: var(--bg);
       color: var(--text);
       font-family: 'DM Sans', sans-serif;
-      font-size: 14px;
+      font-size: 16px;
       line-height: 1.6;
       -webkit-font-smoothing: antialiased;
     }
@@ -146,9 +147,9 @@ const FontLoader = () => (
 
     .chip {
       display: inline-flex; align-items: center; gap: 5px;
-      padding: 3px 10px;
+      padding: 4px 12px;
       border-radius: 20px;
-      font-size: 11px;
+      font-size: 13px;
       font-weight: 600;
       letter-spacing: 0.03em;
     }
@@ -208,6 +209,8 @@ function LoginScreen({ onLogin }) {
       const data = await res.json();
 
       if (data.success) {
+        localStorage.setItem("user", JSON.stringify(data));
+        localStorage.setItem("token", data.token);
         onLogin(data); // { username, role, student_id }
       } else {
         setError("Invalid username or password.");
@@ -583,8 +586,8 @@ function ChatMessage({ msg }) {
         border: isUser ? "none" : "1px solid var(--border2)"
       }}>
         {isUser
-          ? <User size={16} color="#fff" />
-          : <Bot size={16} color="var(--accent)" />
+          ? <User size={18} color="#fff" />
+          : <Bot size={18} color="var(--accent)" />
         }
       </div>
 
@@ -596,7 +599,7 @@ function ChatMessage({ msg }) {
               background: `${badge.color}18`, color: badge.color,
               border: `1px solid ${badge.color}30`
             }}>
-              <BadgeIcon size={10} />
+              <BadgeIcon size={12} />
               {badge.label}
             </span>
             {msg.metadata?.sql_generated && (
@@ -618,7 +621,7 @@ function ChatMessage({ msg }) {
           border: isUser ? "none" : "1px solid var(--border)",
           borderRadius: isUser ? "16px 4px 16px 16px" : "4px 16px 16px 16px",
           color: isUser ? "#fff" : "var(--text)",
-          fontSize: 14, lineHeight: 1.65,
+          fontSize: 22, lineHeight: 1.7,
           boxShadow: isUser ? "0 4px 20px rgba(79,142,247,0.2)" : "none",
           whiteSpace: "pre-wrap", wordBreak: "break-word"
         }}>
@@ -628,16 +631,16 @@ function ChatMessage({ msg }) {
         {msg.metadata?.sql_generated && (
           <details style={{ marginTop: 6 }}>
             <summary style={{
-              fontSize: 11, color: "var(--text3)", cursor: "pointer",
+              fontSize: 15, color: "var(--text3)", cursor: "pointer",
               userSelect: "none", listStyle: "none", display: "inline-flex",
               alignItems: "center", gap: 4
             }}>
-              <ChevronRight size={11} /> View generated SQL
+              <ChevronRight size={13} /> View generated SQL
             </summary>
             <pre style={{
               marginTop: 6, padding: "10px 14px",
               background: "#0a0f1a", border: "1px solid var(--border)",
-              borderRadius: 8, fontSize: 12, fontFamily: "DM Mono",
+              borderRadius: 8, fontSize: 16, fontFamily: "DM Mono",
               color: "#7dd3fc", overflowX: "auto", lineHeight: 1.5,
               whiteSpace: "pre-wrap"
             }}>
@@ -660,6 +663,15 @@ const SUGGESTIONS = [
   "Show me my grades this semester",
   "Can I freeze my semester?",
   "What is the fee refund policy?",
+];
+
+const ADMIN_SUGGESTIONS = [
+  "How many students are on probation?",
+  "What is the average CGPA of all students?",
+  "Show me all students with attendance below 80%",
+  "How many BCS students are there?",
+  "What is the fee refund policy?",
+  "What are the gold medal requirements?",
 ];
 
 // ─── Dashboard View ─────────────────────────────────────────
@@ -800,8 +812,96 @@ function DashboardView({ data }) {
   );
 }
 
+// ─── Admin Dashboard View ─────────────────────────────────────
+function AdminDashboardView() {
+  const [stats, setStats] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/students`)
+      .then(r => r.json())
+      .then(d => {
+        const students = d.students || [];
+        const total = students.length;
+        const avgCgpa = total > 0 ? students.reduce((sum, s) => sum + s.cgpa, 0) / total : 0;
+        const probationCount = students.filter(s => s.cgpa < 2.2).length;
+        setStats({ total, avgCgpa, probationCount, students });
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }, []);
+
+  if (loading) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center",
+        height: "60vh", flexDirection: "column", gap: 14 }}>
+        <Loader2 size={28} color="var(--accent)" style={{ animation: "spin 1s linear infinite" }} />
+        <p style={{ color: "var(--text2)", fontSize: 13 }}>Loading admin statistics…</p>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ padding: "0 0 40px 0" }}>
+      <div className="fade-up" style={{
+        marginBottom: 24, padding: "20px 24px",
+        background: "linear-gradient(135deg, #111827 0%, #1a1f2e 100%)",
+        borderRadius: 18, border: "1px solid var(--border)",
+        display: "flex", alignItems: "center", gap: 20
+      }}>
+        <div style={{
+          width: 56, height: 56, borderRadius: 16, flexShrink: 0,
+          background: "linear-gradient(135deg, var(--accent2), var(--accent))",
+          display: "flex", alignItems: "center", justifyContent: "center"
+        }}>
+          <Shield size={28} color="#fff" />
+        </div>
+        <div>
+          <h2 style={{ fontSize: 20, fontWeight: 700, color: "var(--text)" }}>Admin Overview</h2>
+          <p style={{ color: "var(--text2)", fontSize: 13 }}>University-wide student analytics</p>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 14, marginBottom: 20, flexWrap: "wrap" }}>
+        <StatCard label="Total Students" value={stats.total} icon={User} accent="var(--accent)" />
+        <StatCard label="Average CGPA" value={stats.avgCgpa.toFixed(2)} icon={TrendingUp} accent={gradeColor(stats.avgCgpa)} />
+        <StatCard label="On Probation" value={stats.probationCount} icon={AlertTriangle} accent="var(--warn)" />
+      </div>
+
+      <div className="card fade-up" style={{ animationDelay: "150ms" }}>
+        <h3 style={{ fontSize: 13, fontWeight: 700, color: "var(--text)", marginBottom: 16,
+          display: "flex", alignItems: "center", gap: 8 }}>
+          <GraduationCap size={15} color="var(--accent)" /> Student Roster
+        </h3>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid var(--border)" }}>
+                <th style={{ padding: "6px 10px", textAlign: "left", color: "var(--text3)" }}>ID</th>
+                <th style={{ padding: "6px 10px", textAlign: "left", color: "var(--text3)" }}>Name</th>
+                <th style={{ padding: "6px 10px", textAlign: "left", color: "var(--text3)" }}>Program</th>
+                <th style={{ padding: "6px 10px", textAlign: "left", color: "var(--text3)" }}>CGPA</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats.students.map((s, i) => (
+                <tr key={i} style={{ borderBottom: "1px solid var(--border)", transition: "background 0.1s" }} onMouseEnter={e => e.currentTarget.style.background = "var(--surface2)"} onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                  <td style={{ padding: "10px", fontFamily: "DM Mono", color: "var(--text2)" }}>{s.student_id}</td>
+                  <td style={{ padding: "10px", color: "var(--text)" }}>{s.name}</td>
+                  <td style={{ padding: "10px" }}><span className="chip" style={{ background: "var(--surface2)", color: "var(--text2)" }}>{s.program}</span></td>
+                  <td style={{ padding: "10px", fontFamily: "DM Mono", color: gradeColor(s.cgpa) }}>{s.cgpa.toFixed(2)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Chat View ──────────────────────────────────────────────
-function ChatView({ studentId, studentName }) {
+function ChatView({ studentId, studentName, isAdmin }) {
   const [messages, setMessages] = useState([{
     id: 0, role: "assistant",
     content: `Hello ${studentName?.split(" ")[0]}! 👋 I'm IM|Copilot, your AI academic assistant. I can answer questions about your grades, attendance, GPA, university policies, scholarships, and more. What would you like to know?`,
@@ -810,6 +910,14 @@ function ChatView({ studentId, studentName }) {
   const [input, setInput]   = useState("");
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef(null);
+
+  const handleClearChat = () => {
+    setMessages([{
+      id: Date.now(), role: "assistant",
+      content: `Hello ${studentName?.split(" ")[0]}! 👋 I'm IM|Copilot, your AI academic assistant. I can answer questions about your grades, attendance, GPA, university policies, scholarships, and more. What would you like to know?`,
+      intent: "greeting"
+    }]);
+  };
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -824,12 +932,22 @@ function ChatView({ studentId, studentName }) {
     setInput("");
     setLoading(true);
 
+    const token = localStorage.getItem("token");
+    const historyPayload = messages.filter(m => m.intent !== "greeting").map(m => ({ role: m.role, content: m.content }));
+
     try {
       const res = await fetch(`${API_BASE}/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, student_id: studentId }),
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({ query, history: historyPayload })
       });
+      if (res.status === 401) {
+        setMessages(prev => [...prev, { id: Date.now() + 1, role: "assistant", content: "⚠️ Session expired. Please log out and log in again.", intent: "error" }]);
+        return;
+      }
       const data = await res.json();
       setMessages(prev => [...prev, {
         id: Date.now() + 1,
@@ -857,6 +975,8 @@ function ChatView({ studentId, studentName }) {
     }
   };
 
+  const activeSuggestions = isAdmin ? ADMIN_SUGGESTIONS : SUGGESTIONS;
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
 
@@ -883,15 +1003,15 @@ function ChatView({ studentId, studentName }) {
       {/* Suggestions */}
       {messages.length <= 1 && (
         <div className="fade-up" style={{ paddingBottom: 14 }}>
-          <p style={{ fontSize: 11, color: "var(--text3)", marginBottom: 8, letterSpacing: "0.06em", textTransform: "uppercase", fontWeight: 600 }}>
+          <p style={{ fontSize: 15, color: "var(--text3)", marginBottom: 8, letterSpacing: "0.06em", textTransform: "uppercase", fontWeight: 600 }}>
             Suggested Questions
           </p>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
-            {SUGGESTIONS.map(s => (
+            {activeSuggestions.map(s => (
               <button key={s} onClick={() => sendMessage(s)} style={{
-                padding: "6px 12px", borderRadius: 20,
+                padding: "8px 16px", borderRadius: 20,
                 background: "var(--surface2)", border: "1px solid var(--border2)",
-                color: "var(--text2)", fontSize: 12, transition: "all 0.15s"
+                color: "var(--text2)", fontSize: 18, transition: "all 0.15s"
               }}
                 onMouseEnter={e => { e.currentTarget.style.borderColor = "var(--accent)"; e.currentTarget.style.color = "var(--accent)"; }}
                 onMouseLeave={e => { e.currentTarget.style.borderColor = "var(--border2)"; e.currentTarget.style.color = "var(--text2)"; }}
@@ -906,6 +1026,18 @@ function ChatView({ studentId, studentName }) {
         display: "flex", gap: 10, alignItems: "flex-end",
         paddingTop: 12, borderTop: "1px solid var(--border)"
       }}>
+        <button
+          onClick={handleClearChat}
+          disabled={messages.length <= 1 || loading}
+          title="Clear Chat"
+          style={{
+            padding: "16px", borderRadius: 12, flexShrink: 0,
+            background: "var(--surface2)", border: "1px solid var(--border2)",
+            color: messages.length <= 1 ? "var(--border2)" : "var(--text3)",
+          }}
+        >
+          <X size={22} />
+        </button>
         <div style={{ flex: 1, position: "relative" }}>
           <textarea
             value={input}
@@ -914,9 +1046,9 @@ function ChatView({ studentId, studentName }) {
             placeholder="Ask about your GPA, attendance, policies…"
             rows={1}
             style={{
-              width: "100%", padding: "12px 16px",
+              width: "100%", padding: "16px 20px",
               background: "var(--surface2)", border: "1px solid var(--border2)",
-              borderRadius: 12, color: "var(--text)", fontSize: 14,
+              borderRadius: 12, color: "var(--text)", fontSize: 20,
               resize: "none", fontFamily: "DM Sans",
               outline: "none", lineHeight: 1.5,
               transition: "border-color 0.15s",
@@ -930,11 +1062,11 @@ function ChatView({ studentId, studentName }) {
           className="btn-primary"
           onClick={() => sendMessage()}
           disabled={!input.trim() || loading}
-          style={{ padding: "12px 16px", borderRadius: 12, flexShrink: 0 }}
+          style={{ padding: "16px 20px", borderRadius: 12, flexShrink: 0 }}
         >
           {loading
-            ? <Loader2 size={18} style={{ animation: "spin 1s linear infinite" }} />
-            : <Send size={18} />
+            ? <Loader2 size={22} style={{ animation: "spin 1s linear infinite" }} />
+            : <Send size={22} />
           }
         </button>
       </div>
@@ -951,18 +1083,35 @@ export default function App() {
   const [loadingDB, setLoadingDB] = useState(false);
   const [dbError,   setDbError]   = useState(null);
 
+  useEffect(() => {
+    const savedUser = localStorage.getItem("user");
+    const savedToken = localStorage.getItem("token");
+    if (savedUser && savedToken) {
+      setUser(JSON.parse(savedUser));
+    }
+  }, []);
+
   // Fetch dashboard after login (students only)
   useEffect(() => {
     if (!user || user.role === "admin" || !user.student_id) return;
     setLoadingDB(true);
     setDbError(null);
-    fetch(`${API_BASE}/dashboard/${user.student_id}`)
-      .then(r => r.json())
+    const token = localStorage.getItem("token");
+    fetch(`${API_BASE}/dashboard/${user.student_id}`, {
+      headers: { "Authorization": `Bearer ${token}` }
+    })
+      .then(r => {
+        if (r.status === 401) throw new Error("Session expired. Please log out and log in again.");
+        if (!r.ok) throw new Error("Failed to load dashboard.");
+        return r.json();
+      })
       .then(d => { setDashboard(d); setLoadingDB(false); })
       .catch(e => { setDbError(e.message); setLoadingDB(false); });
   }, [user]);
 
   const handleLogout = () => {
+    localStorage.removeItem("user");
+    localStorage.removeItem("token");
     setUser(null);
     setDashboard(null);
     setActiveTab("dashboard");
@@ -1097,7 +1246,7 @@ export default function App() {
               </h1>
               <p style={{ fontSize: 11, color: "var(--text3)" }}>
                 {activeTab === "dashboard"
-                  ? `${dashboard?.semester_label ?? "—"} · ${student?.program ?? (isAdmin ? "Admin View" : "")}`
+                  ? isAdmin ? "University Overview" : `${dashboard?.semester_label ?? "—"} · ${student?.program ?? ""}`
                   : "Powered by Llama-3 + RAG · IMSciences Handbook"
                 }
               </p>
@@ -1126,17 +1275,7 @@ export default function App() {
           <div style={{ flex: 1, overflowY: "auto", padding: "24px 28px" }}>
             {activeTab === "dashboard" && (
               isAdmin
-                ? (
-                  // Admin placeholder — extend later
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center",
-                    height: "60vh", flexDirection: "column", gap: 14 }}>
-                    <Shield size={40} color="var(--accent2)" />
-                    <p style={{ color: "var(--text)", fontSize: 16, fontWeight: 600 }}>Admin Dashboard</p>
-                    <p style={{ color: "var(--text2)", fontSize: 13 }}>
-                      Student management features coming soon.
-                    </p>
-                  </div>
-                )
+                ? <AdminDashboardView />
                 : loadingDB
                   ? <div style={{ display: "flex", alignItems: "center", justifyContent: "center",
                       height: "60vh", flexDirection: "column", gap: 14 }}>
@@ -1161,6 +1300,7 @@ export default function App() {
                 <ChatView
                   studentId={user.student_id}
                   studentName={isAdmin ? "Admin" : (student?.name ?? user.username)}
+                  isAdmin={isAdmin}
                 />
               </div>
             )}
