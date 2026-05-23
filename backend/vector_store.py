@@ -305,8 +305,8 @@ No fees charged if application submitted before mid-term exams.
 
 18. GPA REQUIREMENT / PROBATION:
 Minimum CGPA of 2.2 must be maintained.
-CGPA below 2.0: student is dropped from rolls immediately.
-CGPA between 2.0 and 2.2: student placed on probation for one semester.
+CGPA < 2.0: student is dropped from rolls immediately.
+CGPA >= 2.0 and < 2.2: student placed on probation for one semester.
 If probation student does not improve to 2.2, studies are detained.
 One-time detention is applicable after the 2nd semester.
 After detention, if CGPA still below 2.2, student is dropped out.

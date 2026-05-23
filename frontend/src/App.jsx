@@ -10,6 +10,8 @@ import {
   RadialBarChart, RadialBar, ResponsiveContainer,
   BarChart, Bar, XAxis, YAxis, Tooltip, Cell
 } from "recharts";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 // ─── Config ────────────────────────────────────────────────
 const API_BASE = "http://localhost:8000";
@@ -159,6 +161,17 @@ const FontLoader = () => (
       border-color: var(--accent) !important;
       box-shadow: 0 0 0 3px rgba(79,142,247,0.15);
     }
+
+    /* Markdown styling */
+    .markdown-body p:last-child { margin-bottom: 0; }
+    .markdown-body p { margin-bottom: 0.8em; }
+    .markdown-body ul, .markdown-body ol { margin-left: 1.2em; margin-bottom: 0.8em; }
+    .markdown-body li { margin-bottom: 0.3em; }
+    .markdown-body strong { font-weight: 700; color: inherit; }
+    .markdown-body table { width: 100%; border-collapse: collapse; margin-bottom: 0.8em; font-size: 0.9em; }
+    .markdown-body th, .markdown-body td { border: 1px solid rgba(255,255,255,0.15); padding: 8px; text-align: left; }
+    .markdown-body th { background: rgba(0,0,0,0.15); }
+    .markdown-body code { font-family: 'DM Mono', monospace; background: rgba(0,0,0,0.15); padding: 2px 5px; border-radius: 4px; font-size: 0.9em; }
   `}</style>
 );
 
@@ -615,7 +628,7 @@ function ChatMessage({ msg }) {
           </div>
         )}
 
-        <div style={{
+        <div className="markdown-body" style={{
           padding: "12px 16px",
           background: isUser ? "linear-gradient(135deg, #4f8ef7ee, #6366f1ee)" : "var(--surface)",
           border: isUser ? "none" : "1px solid var(--border)",
@@ -623,9 +636,11 @@ function ChatMessage({ msg }) {
           color: isUser ? "#fff" : "var(--text)",
           fontSize: 22, lineHeight: 1.7,
           boxShadow: isUser ? "0 4px 20px rgba(79,142,247,0.2)" : "none",
-          whiteSpace: "pre-wrap", wordBreak: "break-word"
+          wordBreak: "break-word"
         }}>
-          {msg.content}
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            {msg.content}
+          </ReactMarkdown>
         </div>
 
         {msg.metadata?.sql_generated && (

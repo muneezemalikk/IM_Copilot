@@ -73,7 +73,7 @@ NOTES:
   - Minimum attendance required: 80%. Below 80% = 'XF Risk'.
   - Passing grade: C (60%). Below 60% = F (grade_points = 0).
   - GPA scale: A+(4.0), A(4.0), B+(3.5), B(3.0), C+(2.5), C(2.0), F(0.0)
-  - Probation: CGPA between 2.0 and 2.2. Drop: CGPA below 2.0.
+  - Good standing: CGPA >= 2.2. Probation: CGPA >= 2.0 and < 2.2. Drop: CGPA < 2.0.
 """
 
 

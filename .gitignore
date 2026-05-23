@@ -1,19 +1,19 @@
-# Python virtual environment
-backend/venv/
-backend/__pycache__/
-backend/*.pyc
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
 
-# Node modules (Frontend)
-frontend/node_modules/
-frontend/dist/
+# Node
+node_modules/
+dist/
+build/
 
-# Mac system files
-.DS_Store
-
-# Sensitive Keys (if you have them)
-.envbackend/*.db
+# Database / Local storage
+backend/imcopilot.db
 backend/chroma_db/
-backend/venv/
-backend/status:*
-backend/service:*
-backend/version:*
+
+# OS generated files
+.DS_Store
